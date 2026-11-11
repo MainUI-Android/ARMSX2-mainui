@@ -288,7 +288,8 @@ android {
             // In-app GitHub-release updater. Github flavor only — Play forbids self-updating,
             // so the real updater + REQUEST_INSTALL_PACKAGES live in src/github and this stays
             // false for play (which uses the src/play no-op stub).
-            buildConfigField("boolean", "IN_APP_UPDATER", "true")
+            // (MainUI-Android build: off, MainUI updates it from MainUI-Android's releases.)
+            buildConfigField("boolean", "IN_APP_UPDATER", "false")
             // LSFG frame generation. Github flavor only, for two independent reasons: the
             // upstream project's consumer app is licensed "No Play Store", and the feature
             // only works when the user supplies their own Lossless.dll, which is not a shape
