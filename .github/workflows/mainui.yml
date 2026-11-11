@@ -92,7 +92,7 @@ jobs:
         working-directory: platforms/android
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace :app:assembleRelease \
+          ./gradlew --no-daemon --stacktrace :app:assembleGithubRelease \
             -Parmsx2.applicationId=com.armsx2.mainui "-Parmsx2.appLabel=ARMSX2 (MainUI)" \
             "-Parmsx2.versionCode=$MAINUI_VERSION_CODE" "-Parmsx2.versionName=$MAINUI_VERSION_NAME"
       - name: Sign
@@ -103,7 +103,7 @@ jobs:
           MAINUI_KEY_ALIAS: ${{ secrets.MAINUI_KEY_ALIAS }}
           MAINUI_KEY_PASSWORD: ${{ secrets.MAINUI_KEY_PASSWORD }}
         run: |
-          apk=$(ls platforms/android/app/build/outputs/apk/release/*.apk | head -1)
+          apk=$(ls platforms/android/app/build/outputs/apk/github/release/*.apk | head -1)
           cp "$apk" "$APK_NAME-unsigned.apk"
           set +e; bash .github/mainui/ci.sh sign "$apk" "$APK_NAME.apk"; rc=$?; set -e
           if [ $rc = 0 ]; then echo "signed=true" >> "$GITHUB_OUTPUT"; elif [ $rc != 2 ]; then exit $rc; fi
