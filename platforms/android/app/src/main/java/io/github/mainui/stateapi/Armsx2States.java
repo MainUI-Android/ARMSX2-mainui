@@ -2,6 +2,8 @@ package io.github.mainui.stateapi;
 
 import java.io.File;
 
+import com.armsx2.runtime.MainActivityRuntime;
+
 import kr.co.iefriends.pcsx2.NativeApp;
 
 /**
@@ -27,10 +29,30 @@ public final class Armsx2States implements MainUIStateApi.Emulator {
 
     @Override public int slotCount() { return SLOTS; }
 
+    // The quick menu's pause: the audio stream stays open (a stopped one is reclaimed by Android
+    // and can come back silent). Held, so the stuck-pause backstop doesn't resume it.
+    @Override
+    public boolean pause() {
+        MainActivityRuntime.Companion.getUserHeldPause().setValue(true);
+        MainActivityRuntime.Companion.pauseForOverlay();
+        return true;
+    }
+
+    @Override public void resume() { MainActivityRuntime.Companion.resume(); }
+
+    // Saving and loading park the VM, which pauses the audio stream unless suppressed (as behind
+    // the quick menu): a stream paused through a slow save is reclaimed and stays silent.
     @Override
     public String save(int slot) throws Exception {
         int index = index(slot);
-        if (!NativeApp.saveStateToSlot(index)) {
+        boolean saved;
+        NativeApp.setOutputPauseSuppressed(true);
+        try {
+            saved = NativeApp.saveStateToSlot(index);
+        } finally {
+            NativeApp.setOutputPauseSuppressed(false);
+        }
+        if (!saved) {
             throw new IllegalStateException(NativeApp.isMemcardBusy()
                 ? "the memory card is being written: try again in a moment" : "ARMSX2 couldn't save the state");
         }
@@ -40,7 +62,14 @@ public final class Armsx2States implements MainUIStateApi.Emulator {
 
     @Override
     public void load(int slot) throws Exception {
-        if (!NativeApp.loadStateFromSlot(index(slot))) throw new IllegalStateException("ARMSX2 couldn't load the state");
+        boolean loaded;
+        NativeApp.setOutputPauseSuppressed(true);
+        try {
+            loaded = NativeApp.loadStateFromSlot(index(slot));
+        } finally {
+            NativeApp.setOutputPauseSuppressed(false);
+        }
+        if (!loaded) throw new IllegalStateException("ARMSX2 couldn't load the state");
     }
 
     @Override
