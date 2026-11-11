@@ -1235,6 +1235,14 @@ public class NativeApp {
 	 *  and name-en the romanised one. */
 	public static native String getTitlesForSerial(String serial);
 
+	// MainUI State API (io.github.mainui.stateapi.Armsx2States): called from runVMThread once a
+	// game runs.
+	public static void onMainUIGameStarted() {
+		io.github.mainui.stateapi.MainUIStateApi.attach(io.github.mainui.stateapi.Armsx2States.INSTANCE);
+	}
+	public static native boolean mainuiRunning();
+	public static native boolean mainuiReady();
+
 	public static native boolean saveStateToSlot(int slot);
 	/** True while the emulated memory card is mid-write, when a state save is refused to protect
 	 *  the card. The counter only ticks down while the VM runs, so it does NOT clear while paused. */

@@ -81,6 +81,17 @@
         android:allowNativeHeapPointerTagging="false"
         tools:targetApi="31"
         >
+
+        <!-- MainUI State API: MainUI (a frontend) saves and loads states with broadcasts. -->
+        <meta-data android:name="io.github.mainui.STATE_API" android:value="1" />
+        <receiver
+            android:name="io.github.mainui.stateapi.MainUIStateApi$Receiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="io.github.mainui.stateapi.COMMAND" />
+            </intent-filter>
+        </receiver>
         <!-- Declare game mode support (Android 12+) — routes app through GameManager
              performance profile so the OS scheduler and CPU/GPU governors prefer
              big cores and peak clocks instead of throttling as a normal app. -->

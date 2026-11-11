@@ -4306,6 +4306,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
         GSSetPresentCapSuspended(false);
         VMState _vmState = VMState::Running;
         VMManager::SetState(_vmState);
+        // MainUI State API: a game is running — MainUI's commands go to it from now on.
+        if (jmethodID mainui_mid = env->GetStaticMethodID(clazz, "onMainUIGameStarted", "()V"))
+            env->CallStaticVoidMethod(clazz, mainui_mid);
+        if (env->ExceptionCheck())
+            env->ExceptionClear();
         ////
         while (true) {
             if (s_stop_requested.load(std::memory_order_acquire)) {
@@ -7730,4 +7735,21 @@ Java_kr_co_iefriends_pcsx2_NativeApp_zstdDecoderDecode(
 	if (zo.pos > 0)
 		env->SetByteArrayRegion(out, out_off, static_cast<jsize>(zo.pos), out_buf.data());
 	return static_cast<jint>(zo.pos);
+}
+
+// MainUI State API (io.github.mainui.stateapi.Armsx2States): MainUI (a frontend) saves and loads
+// states directly, through saveStateToSlot / loadStateFromSlot above.
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_mainuiRunning(JNIEnv *env, jclass clazz) {
+    // A game is running (past the BIOS: its states have a name).
+    return VMManager::HasValidVM() && SaveStatesHaveName() && !VMManager::GetDiscSerial().empty();
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_mainuiReady(JNIEnv *env, jclass clazz) {
+    // Running, not paused (menu, screen in the background), the memory card not mid-write.
+    return VMManager::HasValidVM() && VMManager::GetState() == VMState::Running && SaveStatesHaveName()
+        && !VMManager::GetDiscSerial().empty() && !MemcardBusy::IsBusy();
 }
