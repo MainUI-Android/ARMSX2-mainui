@@ -33,12 +33,23 @@ public final class Armsx2States implements MainUIStateApi.Emulator {
     // and can come back silent). Held, so the stuck-pause backstop doesn't resume it.
     @Override
     public boolean pause() {
+        // (The user's own pause, from the second screen, is theirs: MainUI's resume keeps it.)
+        if (Boolean.TRUE.equals(MainActivityRuntime.Companion.getUserHeldPause().getValue())) return true;
         MainActivityRuntime.Companion.getUserHeldPause().setValue(true);
         MainActivityRuntime.Companion.pauseForOverlay();
+        pausedByMainUi = true;
         return true;
     }
 
-    @Override public void resume() { MainActivityRuntime.Companion.resume(); }
+    /** MainUI's pause took effect. */
+    private static volatile boolean pausedByMainUi;
+
+    @Override
+    public void resume() {
+        if (!pausedByMainUi) return;
+        pausedByMainUi = false;
+        MainActivityRuntime.Companion.resume();
+    }
 
     // Saving and loading park the VM, which pauses the audio stream unless suppressed (as behind
     // the quick menu): a stream paused through a slow save is reclaimed and stays silent.
