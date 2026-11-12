@@ -3,6 +3,7 @@ package io.github.mainui.stateapi;
 import java.io.File;
 
 import com.armsx2.runtime.MainActivityRuntime;
+import com.armsx2.ui.WindowImpl;
 
 import kr.co.iefriends.pcsx2.NativeApp;
 
@@ -33,8 +34,9 @@ public final class Armsx2States implements MainUIStateApi.Emulator {
     // and can come back silent). Held, so the stuck-pause backstop doesn't resume it.
     @Override
     public boolean pause() {
-        // (The user's own pause, from the second screen, is theirs: MainUI's resume keeps it.)
-        if (Boolean.TRUE.equals(MainActivityRuntime.Companion.getUserHeldPause().getValue())) return true;
+        // (ARMSX2's own pause, its quick menu or the second screen's, is theirs: MainUI's resume
+        // keeps it. MainUI's own is put back after a save, which resumes the VM.)
+        if (!pausedByMainUi && ownPause()) return true;
         MainActivityRuntime.Companion.getUserHeldPause().setValue(true);
         MainActivityRuntime.Companion.pauseForOverlay();
         pausedByMainUi = true;
@@ -43,12 +45,35 @@ public final class Armsx2States implements MainUIStateApi.Emulator {
 
     /** MainUI's pause took effect. */
     private static volatile boolean pausedByMainUi;
+    /** The pause lifted for a save or load was the user's (second screen). */
+    private static volatile boolean liftedHeld;
+
+    /** ARMSX2 holds its own pause: the user's (second screen) or its quick menu's. */
+    private static boolean ownPause() {
+        return Boolean.TRUE.equals(MainActivityRuntime.Companion.getUserHeldPause().getValue())
+            || Boolean.TRUE.equals(WindowImpl.INSTANCE.getOverlayVisible().getValue())
+            || WindowImpl.INSTANCE.getInGameScreen().getValue() != null;
+    }
 
     @Override
     public void resume() {
         if (!pausedByMainUi) return;
         pausedByMainUi = false;
         MainActivityRuntime.Companion.resume();
+    }
+
+    @Override
+    public boolean liftOwnPause() {
+        if (pausedByMainUi || !ownPause()) return false;
+        liftedHeld = Boolean.TRUE.equals(MainActivityRuntime.Companion.getUserHeldPause().getValue());
+        MainActivityRuntime.Companion.resume();
+        return true;
+    }
+
+    @Override
+    public void restoreOwnPause() {
+        if (liftedHeld) MainActivityRuntime.Companion.getUserHeldPause().setValue(true);
+        MainActivityRuntime.Companion.pauseForOverlay();
     }
 
     // Saving and loading park the VM, which pauses the audio stream unless suppressed (as behind
