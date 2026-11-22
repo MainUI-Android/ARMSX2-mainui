@@ -9,8 +9,8 @@
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
 #include "GS/Renderers/Vulkan/GSDeviceVK.h"
+#include "GS/Renderers/HW/GSDrawRow.h"
 #include "GS/Renderers/Vulkan/GSLsfg.h"
-#include "GS/Renderers/Vulkan/GSRunsVK.h"
 #include "GS/Renderers/Vulkan/VKBuilders.h"
 #include "GS/Renderers/Vulkan/VKCalibratedTimestamps.h"
 #include "GS/Renderers/Vulkan/VKShaderCache.h"
@@ -607,8 +607,8 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list)
 	// (GSTextureVK::MakeUncompressed). Requested on Adreno only, so no other device changes.
 	m_optional_extensions.vk_ext_image_compression_control =
 		IsDeviceAdreno() && SupportsExtension(VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME, false);
-	// VK_EXT_descriptor_indexing: the run machine's per-draw textures (GSRunsVK.h). Its features are probed in
-	// CreateDevice; without them the machine stays off and the extension is enabled but unused.
+	// VK_EXT_descriptor_indexing: the run program's per-row textures (GSRunEmitterVK.h). Its features are probed in
+	// CreateDevice; without them the run program stays off and the extension is enabled but unused.
 	m_optional_extensions.vk_ext_descriptor_indexing = SupportsExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME, false);
 
 	if (m_optional_extensions.vk_swapchain_maintenance1)
@@ -989,7 +989,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			m_optional_extensions.vk_ext_image_compression_control, probe_icc.imageCompressionControl == VK_TRUE);
 		m_optional_extensions.vk_khr_shader_float16_int8 = keep("VK_KHR_shader_float16_int8 (shaderFloat16)",
 			m_optional_extensions.vk_khr_shader_float16_int8, probe_f16.shaderFloat16 == VK_TRUE);
-		m_optional_extensions.vk_ext_descriptor_indexing = keep("VK_EXT_descriptor_indexing (run machine features)",
+		m_optional_extensions.vk_ext_descriptor_indexing = keep("VK_EXT_descriptor_indexing (run program features)",
 			m_optional_extensions.vk_ext_descriptor_indexing,
 			probe_di.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && probe_di.runtimeDescriptorArray == VK_TRUE &&
 				probe_di.descriptorBindingPartiallyBound == VK_TRUE);
@@ -1573,6 +1573,53 @@ VkRenderPass GSDeviceVK::GetRenderPass(VkFormat color_format, VkFormat depth_for
 	return CreateCachedRenderPass(key);
 }
 
+GSVector4i GSDeviceVK::NarrowRenderArea(const GSVector4i& drawarea, const GSVector2i& size)
+{
+	// drawarea gets a two-pixel margin: its edges can land a device pixel short, and it leaves out the vertex shader's
+	// offset.
+	static constexpr int MARGIN = 2;
+	return (drawarea + GSVector4i(-MARGIN, -MARGIN, MARGIN, MARGIN)).rintersect(GSVector4i::loadh(size));
+}
+
+GSVector4i GSDeviceVK::AlignRenderArea(VkRenderPass rp, const GSVector4i& area, const GSVector2i& size)
+{
+	// The granularity is the tile size on every driver, so it is asked once. An unaligned area is only slower.
+	if (m_render_area_granularity.width == 0)
+	{
+		vkGetRenderAreaGranularity(m_device, rp, &m_render_area_granularity);
+		m_render_area_granularity.width = std::max(m_render_area_granularity.width, 1u);
+		m_render_area_granularity.height = std::max(m_render_area_granularity.height, 1u);
+	}
+	const s32 gw = static_cast<s32>(m_render_area_granularity.width);
+	const s32 gh = static_cast<s32>(m_render_area_granularity.height);
+	const GSVector4i aligned((area.left / gw) * gw, (area.top / gh) * gh, ((area.right + gw - 1) / gw) * gw,
+		((area.bottom + gh - 1) / gh) * gh);
+	return aligned.rintersect(GSVector4i::loadh(size));
+}
+
+bool GSDeviceVK::IsDeviceNamed(const char* name) const
+{
+	// Mesa names a Mali "Mali-" and its short name, then a space and more: "Mali-G31" must not match the G310.
+	const size_t len = std::strlen(name);
+	const char* device = m_device_properties.deviceName;
+	return std::strncmp(device, name, len) == 0 && (device[len] == '\0' || device[len] == ' ');
+}
+
+bool GSDeviceVK::IsDevicePanVKBifrost() const
+{
+	if (g_gs_measurement_overrides.panvk_bifrost)
+		return true;
+	if (m_device_driver_properties.driverID != VK_DRIVER_ID_MESA_PANVK)
+		return false;
+	static constexpr const char* bifrost[] = {"Mali-G31", "Mali-G51", "Mali-G52", "Mali-G71", "Mali-G72", "Mali-G76"};
+	for (const char* name : bifrost)
+	{
+		if (IsDeviceNamed(name))
+			return true;
+	}
+	return false;
+}
+
 VkRenderPass GSDeviceVK::GetRenderPassForRestarting(VkRenderPass pass)
 {
 	for (const auto& it : m_render_pass_cache)
@@ -1891,7 +1938,7 @@ void GSDeviceVK::EndGPUTiming(u32 index)
 
 	if (wants_timestamp && resources.timestamp_query_state == QueryState::Querying)
 	{
-		vkCmdWriteTimestamp(m_current_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool,
+		vkCmdWriteTimestamp(GetCurrentCommandBuffer(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool,
 			m_current_frame * 2 + 1);
 		resources.timestamp_query_state = QueryState::Ready;
 	}
@@ -2049,6 +2096,10 @@ void GSDeviceVK::WaitForCommandBufferCompletion(u32 index)
 
 void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 {
+	// Every submit ends the pass first, and every pass end records the rows pending: their ring data belongs to this
+	// command buffer.
+	pxAssertMsg(!m_emitter || !m_emitter->AnyPending(), "Rows are pending at a submit");
+	FlushRun();
 	m_render_passes_since_submit = 0;
 	m_draws_since_submit = 0;
 	m_next_in_pass_kick_offer = 0;
@@ -2073,7 +2124,7 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 	{
 		// Didn't end query in DoBeginPresent() so end it here.
 		resources.pipeline_statistics_query = QueryState::Ready;
-		vkCmdEndQuery(m_current_command_buffer, m_pipeline_statistics_query_pool, m_current_frame);
+		vkCmdEndQuery(GetCurrentCommandBuffer(), m_pipeline_statistics_query_pool, m_current_frame);
 	}
 
 	res = vkEndCommandBuffer(resources.command_buffers[1]);
@@ -3278,7 +3329,10 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	if (!CompileImGuiPipeline())
 		return false;
 
-	m_runs = GSRunsVK::Create(this);
+	// Rows are recorded through the emitter (GSRowEmitter.h): twins wait for later bases, with or without the run
+	// program to merge rows.
+	m_emitter = std::make_unique<GSRunEmitterVK>(this);
+	m_rows_defer = true;
 
 	InitializeState();
 #ifdef __ANDROID__
@@ -3604,10 +3658,6 @@ GSDevice::PresentResult GSDeviceVK::DoBeginPresent(bool frame_skip)
 {
 	EndRenderPass();
 
-	// Every vsync, skipped or not: the run machine decides from the frame just finished whether the next may open runs.
-	if (m_runs)
-		m_runs->EndFrame();
-
 	// Check if the device was lost.
 	if (m_last_submit_failed)
 		return PresentResult::DeviceLost;
@@ -3683,7 +3733,7 @@ GSDevice::PresentResult GSDeviceVK::DoBeginPresent(bool frame_skip)
 	if (resources.pipeline_statistics_query == QueryState::Querying)
 	{
 		resources.pipeline_statistics_query = QueryState::Ready;
-		vkCmdEndQuery(m_current_command_buffer, m_pipeline_statistics_query_pool, m_current_frame);
+		vkCmdEndQuery(GetCurrentCommandBuffer(), m_pipeline_statistics_query_pool, m_current_frame);
 	}
 
 	// Before anything below records a use of the swap chain: this may rebuild it.
@@ -4158,6 +4208,9 @@ bool GSDeviceVK::CheckFeatures()
 		Console.WriteLn("VK: malisx2 index ranges from the application: %s", m_cmd_set_index_range ? "yes" : "no");
 	m_index_range_valid = false;
 
+	m_cmd_draw_run = reinterpret_cast<PFN_vkCmdDrawRunARMSX2>(vkGetDeviceProcAddr(m_device, "vkCmdDrawRunARMSX2"));
+	Console.WriteLn("VK: driver run entry (vkCmdDrawRunARMSX2): %s", m_cmd_draw_run ? "yes" : "no");
+
 	const GSSelfReadRoadDecision road = ResolveSelfReadRoad();
 	ResolveFeatureTable();
 	ResolveFeedbackConsumers(road);
@@ -4429,7 +4482,8 @@ void GSDeviceVK::ResolveFeatureTable()
 	m_features.sub_texel_precision_bits = static_cast<u8>(std::min<u32>(m_device_properties.limits.subTexelPrecisionBits, 16));
 
 	// geometryShader is needed because gl_PrimitiveID is part of the Geometry SPIR-V Execution Model.
-	m_features.primitive_id = m_device_features.geometryShader;
+	// Bifrost has no geometry shaders, so gsrunner -panvk-bifrost takes primitive-ID DATE away too.
+	m_features.primitive_id = m_device_features.geometryShader && !g_gs_measurement_overrides.panvk_bifrost;
 
 	m_features.prefer_new_textures = true;
 #if defined(__ANDROID__)
@@ -4440,6 +4494,7 @@ void GSDeviceVK::ResolveFeatureTable()
 #endif
 	m_features.provoking_vertex_last = m_optional_extensions.vk_ext_provoking_vertex;
 	m_features.vs_expand = !GSConfig.DisableVertexShaderExpand;
+	m_narrow_render_area = IsDevicePanVKBifrost();
 	m_features.sprite_edge_clamp = true;
 	m_features.sprite_ramp = true;
 
@@ -4494,8 +4549,9 @@ void GSDeviceVK::ResolveFeatureTable()
 
 	m_features.native_counter_draws = true;
 
-	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
-	m_features.stencil_buffer &= !m_features.framebuffer_fetch;
+	// Use D32F depth instead of D32S8 when we have framebuffer fetch. PanVK on Bifrost has none, so gsrunner
+	// -panvk-bifrost keeps the stencil buffer where the device has D32S8.
+	m_features.stencil_buffer &= !m_features.framebuffer_fetch || g_gs_measurement_overrides.panvk_bifrost;
 
 	// Turnip before Mesa 26.2 hangs on EARLY_Z_LATE_Z with a D32S8 attachment and a discarding shader,
 	// which is SetupDATE's stencil pre-pass (rule vk-turnip-d32s8-early-z-late-z-hang). Without a stencil
@@ -4503,6 +4559,18 @@ void GSDeviceVK::ResolveFeatureTable()
 	if (UsesMobileDriverWorkaround(DriverWorkaround::DisableStencilBuffer) ||
 		g_gs_measurement_overrides.disable_stencil_buffer)
 		m_features.stencil_buffer = false;
+
+	// PanVK on Bifrost compresses D32F depth but not D32F_S8, and a game's depth rarely needs stencil,
+	// so depth carries stencil only when it is made for a stencil draw. The Mali-G31 has no AFBC, so
+	// there it would pay for the swaps and gain nothing.
+	m_features.stencil_on_request = IsDevicePanVKBifrost() && m_features.stencil_buffer &&
+		!IsDeviceNamed("Mali-G31");
+	if (m_features.stencil_on_request)
+		Console.WriteLn("VK: Depth carries stencil only where a draw uses it.");
+
+	// The same GPUs would rather copy the target for a DATE draw without depth than build its stencil
+	// in a temporary depth buffer.
+	m_features.date_reads_without_depth = IsDevicePanVKBifrost();
 
 	// The colour-wrap counter in the stencil unit (GSStencilCounter.h) needs the stencil buffer and a
 	// stencil aspect it can sample for the resolve. Wherever the stencil buffer is on, its exactness
@@ -4889,6 +4957,15 @@ void GSDeviceVK::DrawIndexedPrimitive(int offset, int count)
 {
 	pxAssert(offset + count <= (int)m_index.count);
 	g_perfmon.Put(GSPerfMon::DrawCalls, 1);
+	if (m_run_group_open)
+	{
+		// The state ApplyTFXState took for the run, and this draw: one group.
+		m_run_group_open = false;
+		AppendRunGroup(m_current_pipeline, m_run_open_mask, m_tfx_textures.data(), m_tfx_sampler, m_tfx_ubo_descriptor_set,
+			m_tfx_dynamic_offsets.data(), m_index.start + offset, static_cast<u32>(count), static_cast<s32>(m_vertex.start),
+			m_blend_constant_color, m_scissor, m_run_open_flags);
+		return;
+	}
 	const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
 	// Only a draw of all of m_index: a part of it could use fewer vertices than the whole range, and
 	// is left to the driver's read-back as before. The index buffer is bound by now (ApplyTFXState /
@@ -4971,7 +5048,7 @@ VkFormat GSDeviceVK::LookupNativeFormat(GSTexture::Format format) const
 	if (format == GSTexture::Format::ColorClip && m_colorclip_fallback_to_hdr)
 		return VK_FORMAT_R16G16B16A16_SFLOAT;
 
-	return (format != GSTexture::Format::DepthStencil || m_features.stencil_buffer) ?
+	return (format != GSTexture::Format::DepthStencil || (m_features.stencil_buffer && !m_features.stencil_on_request)) ?
 		s_format_mapping[static_cast<int>(format)] :
 		VK_FORMAT_D32_SFLOAT;
 }
@@ -5045,8 +5122,8 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 			const VkClearRect cr = {{{static_cast<s32>(destX), static_cast<s32>(destY)},
 										{static_cast<u32>(r.width()), static_cast<u32>(r.height())}},
 				0u, 1u};
-			if (m_runs)
-				m_runs->Flush(GSRunsVK::END_OTHER);
+			if (m_emitter)
+				m_emitter->RecordOpen();
 			vkCmdClearAttachments(GetCurrentCommandBuffer(), 1, &ca, 1, &cr);
 			m_date_copy.valid = false; // see OMSetRenderTargets
 			m_run_snapshot.stale = 0xFF;
@@ -5064,6 +5141,16 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 	// (the area outside of where we're copying to)
 	if (dTexVK->GetState() == GSTexture::State::Cleared && !full_draw_copy)
 		dTexVK->CommitClear();
+
+	// Depth with and without stencil (stencil_on_request keeps both kinds) cannot be copied as images: Vulkan copies
+	// depth only between equal formats. Draw the depth across instead.
+	if (sTexVK->GetVkFormat() != dTexVK->GetVkFormat() && sTexVK->IsDepthStencil() && dTexVK->IsDepthStencil()) [[unlikely]]
+	{
+		DoStretchRect(sTex, GSVector4(r) / GSVector4(sTexVK->GetSize()).xyxy(), dTex,
+			GSVector4(GSVector4i(destX, destY, destX + r.width(), destY + r.height())),
+			ShaderConvertSelector(ShaderConvert::DEPTH_COPY, 0xf, true), Nearest);
+		return;
+	}
 
 	// *now* we can do a normal image copy.
 	const VkImageAspectFlags src_aspect =
@@ -5089,6 +5176,47 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 	dTexVK->SetState(GSTexture::State::Dirty);
 }
 
+void GSDeviceVK::GiveDepthStencil(GSTexture* ds)
+{
+	// Copy the depth into a spare that has stencil, then trade images: every holder of ds keeps it.
+	GSTextureVK* const tex = static_cast<GSTextureVK*>(ds);
+	if (!m_features.stencil_on_request || tex->HasStencilAspect())
+		return;
+	// The rows pending in the open pass were decided against the image ds has now, and may sample it.
+	EndRenderPass();
+	GSTextureVK* const spare = static_cast<GSTextureVK*>(CreateDepthStencil(tex->GetSize(), false, true, true));
+	if (!spare)
+		return;
+
+	switch (tex->GetState())
+	{
+		case GSTexture::State::Cleared:
+			ClearDepth(spare, tex->GetClearDepth());
+			break;
+		case GSTexture::State::Dirty:
+			DoStretchRect(tex, GSVector4(0, 0, 1, 1), spare, GSVector4(spare->GetRect()),
+				ShaderConvertSelector(ShaderConvert::DEPTH_COPY, 0xf, true), Nearest);
+			break;
+		default:
+			InvalidateRenderTarget(spare);
+			break;
+	}
+
+	tex->SwapStencilImage(spare);
+	Recycle(spare);
+
+	// A game that makes its depth anew each frame asks again each frame. Past 8 swaps within 60 frames, new depth is
+	// made with stencil for the next 600 frames, and then without it again: a game that still asks swaps its way back
+	// in, and one that stopped, or a game started since, has its depth compressed again.
+	if (m_frame - m_depth_stencil_gift_frame > 60)
+	{
+		m_depth_stencil_gift_frame = m_frame;
+		m_depth_stencil_gifts = 0;
+	}
+	if (++m_depth_stencil_gifts > 8)
+		m_depth_stencil_until = m_frame + 600;
+}
+
 void GSDeviceVK::DoStretchRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 	ShaderConvertSelector shader, Filter filter)
 {
@@ -5102,7 +5230,7 @@ void GSDeviceVK::DoStretchRect(GSTexture* sTex, const GSVector4& sRect, GSTextur
 		SetUtilityPushConstants(&source_size, sizeof(source_size));
 	}
 	DoStretchRect(static_cast<GSTextureVK*>(sTex), sRect, static_cast<GSTextureVK*>(dTex), dRect,
-		GetConvertPipeline(shader), filter, allow_discard);
+		GetConvertPipelineFor(shader, static_cast<GSTextureVK*>(dTex)), filter, allow_discard);
 }
 
 void GSDeviceVK::DoStretchRect(GSTexture* sTex, const GSVector4& sRect, const GSVector4& dRect,
@@ -5237,6 +5365,9 @@ void GSDeviceVK::DoMultiStretchRects(
 	// Even though we're batching, a cmdbuffer submit could've messed this up.
 	const GSVector4i rc(dTex->GetRect());
 	OMSetRenderTargets(dTex->IsRenderTarget() ? dTex : nullptr, dTex->IsDepthStencil() ? dTex : nullptr, rc);
+	// A pass opened over its draws (m_narrow_render_area) holds the rects only if it covers the target.
+	if (m_narrow_render_area && InRenderPass() && !m_current_render_pass_area.rcontains(rc))
+		EndRenderPass();
 	if (!InRenderPass())
 		BeginRenderPassForStretchRect(dTex, rc, rc, false);
 	SetUtilityTexture(rects[0].src, rects[0].filter == Biln ? m_linear_sampler : m_point_sampler);
@@ -5247,7 +5378,7 @@ void GSDeviceVK::DoMultiStretchRects(
 		SetUtilityPushConstants(&source_size, sizeof(source_size));
 	}
 
-	SetPipeline(GetConvertPipeline(shader.SetMask(rects[0].wmask.wrgba)));
+	SetPipeline(GetConvertPipelineFor(shader.SetMask(rects[0].wmask.wrgba), dTex));
 
 	if (ApplyUtilityState())
 		DrawIndexedPrimitive();
@@ -5264,11 +5395,14 @@ void GSDeviceVK::BeginRenderPassForStretchRect(
 
 	if (dTex->IsDepthStencil())
 	{
+		const bool s8 = (DepthSlot(dTex) == 2);
 		if (load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			BeginClearRenderPass(m_utility_depth_render_pass_clear, dtex_rc, dTex->GetClearDepth(), 0);
+			BeginClearRenderPass(s8 ? m_utility_depth_s8_render_pass_clear : m_utility_depth_render_pass_clear, dtex_rc,
+				dTex->GetClearDepth(), 0);
+		else if (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+			BeginRenderPass(s8 ? m_utility_depth_s8_render_pass_discard : m_utility_depth_render_pass_discard, dtex_rc);
 		else
-			BeginRenderPass((load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE) ? m_utility_depth_render_pass_discard :
-			                                                               m_utility_depth_render_pass_load, dtex_rc);
+			BeginRenderPass(s8 ? m_utility_depth_s8_render_pass_load : m_utility_depth_render_pass_load, dtex_rc);
 	}
 	else if (dTex->GetFormat() == GSTexture::Format::Color)
 	{
@@ -5319,6 +5453,14 @@ void GSDeviceVK::DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSText
 		OMSetRenderTargets(depth ? nullptr : dTex, depth ? dTex : nullptr, dst_rc);
 		if (InRenderPass() && dTex->GetState() == GSTexture::State::Cleared)
 			EndRenderPass();
+		// A pass opened over its draws (m_narrow_render_area) holds the stretch only if it covers it.
+		if (m_narrow_render_area && InRenderPass() &&
+			!m_current_render_pass_area.rcontains(GSVector4i(static_cast<int>(std::floor(dRect.x)),
+				static_cast<int>(std::floor(dRect.y)), static_cast<int>(std::ceil(dRect.z)),
+				static_cast<int>(std::ceil(dRect.w))).rintersect(dtex_rc)))
+		{
+			EndRenderPass();
+		}
 	}
 	else
 	{
@@ -6072,8 +6214,8 @@ void GSDeviceVK::OMSetRenderTargets(
 			{
 				const GSVector2i size = vkRt ? vkRt->GetSize() : vkDs->GetSize();
 				const VkClearRect cr = {{{0, 0}, {static_cast<u32>(size.x), static_cast<u32>(size.y)}}, 0u, 1u};
-				if (m_runs)
-					m_runs->Flush(GSRunsVK::END_OTHER);
+				if (m_emitter)
+					m_emitter->RecordOpen();
 				vkCmdClearAttachments(GetCurrentCommandBuffer(), num_ca, cas.data(), 1, &cr);
 				// A clear inside the pass rewrites alpha the shared DATE stencil copy describes.
 				m_date_copy.valid = false;
@@ -6208,6 +6350,7 @@ void GSDeviceVK::ClearSamplerCache()
 			vkDestroySampler(m_device, it.second, nullptr);
 	}
 	m_samplers.clear();
+	m_row_sampler_key = ~0ull;
 	m_point_sampler = GetSampler(GSHWDrawConfig::SamplerSelector::Point());
 	m_linear_sampler = GetSampler(GSHWDrawConfig::SamplerSelector::Linear());
 	m_utility_sampler = m_point_sampler;
@@ -6398,19 +6541,11 @@ bool GSDeviceVK::CreateNullTexture()
 
 void GSDeviceVK::FlushStreamRingWrites()
 {
-	// Every ring, not just the ones this submission is known to have touched: a ring that was not
-	// written has nothing pending and costs a compare, and deciding per ring which one a
-	// submission read is the kind of bookkeeping that is wrong once and then silently wrong
-	// forever on the one device that needs the clean. The six below are the device's own; the run
-	// machine owns two more, which are on the same memory road.
-	m_vertex_stream_buffer.FlushPendingWrites();
-	m_index_stream_buffer.FlushPendingWrites();
-	m_expand_index_stream_buffer.FlushPendingWrites();
-	m_vertex_uniform_stream_buffer.FlushPendingWrites();
-	m_fragment_uniform_stream_buffer.FlushPendingWrites();
-	m_texture_stream_buffer.FlushPendingWrites();
-	if (m_runs)
-		m_runs->FlushRingWrites();
+	// Every ring that exists, not just the ones this submission is known to have touched: a ring
+	// that was not written has nothing pending and costs a compare. The registry holds every ring
+	// from its creation to its destruction, the run program's included, which a hand-written list
+	// of the device's six left out.
+	VKStreamBuffer::FlushAllPendingWrites();
 }
 
 bool GSDeviceVK::CreateBuffers()
@@ -6594,10 +6729,11 @@ bool GSDeviceVK::CreateRenderPasses()
 	const VkFormat rt_format = LookupNativeFormat(GSTexture::Format::Color);
 	const VkFormat colclip_rt_format = LookupNativeFormat(GSTexture::Format::ColorClip);
 	const VkFormat depth_format = LookupNativeFormat(GSTexture::Format::DepthStencil);
+	const VkFormat s8_format = m_features.stencil_on_request ? VK_FORMAT_D32_SFLOAT_S8_UINT : depth_format;
 
 	for (u32 rt = 0; rt < 2; rt++)
 	{
-		for (u32 ds = 0; ds < 2; ds++)
+		for (u32 ds = 0; ds < 3; ds++)
 		{
 			for (u32 colclip = 0; colclip < 2; colclip++)
 			{
@@ -6613,7 +6749,8 @@ bool GSDeviceVK::CreateRenderPasses()
 								{
 									const VkFormat rp_rt_format =
 										(rt != 0) ? ((colclip != 0) ? colclip_rt_format : rt_format) : VK_FORMAT_UNDEFINED;
-									const VkFormat rp_depth_format = (ds != 0) ? depth_format : VK_FORMAT_UNDEFINED;
+									const VkFormat rp_depth_format =
+										(ds == 0) ? VK_FORMAT_UNDEFINED : (ds == 2) ? s8_format : depth_format;
 									const VkAttachmentLoadOp opc = (!stencil || !m_features.stencil_buffer) ?
 									                                   VK_ATTACHMENT_LOAD_OP_DONT_CARE :
 									                                   VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -6641,8 +6778,15 @@ bool GSDeviceVK::CreateRenderPasses()
 		VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
 	GET(m_utility_depth_render_pass_discard, VK_FORMAT_UNDEFINED, depth_format, false, false,
 		VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+	GET(m_utility_depth_s8_render_pass_load, VK_FORMAT_UNDEFINED, s8_format, false, false,
+		VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+	GET(m_utility_depth_s8_render_pass_clear, VK_FORMAT_UNDEFINED, s8_format, false, false,
+		VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+	GET(m_utility_depth_s8_render_pass_discard, VK_FORMAT_UNDEFINED, s8_format, false, false,
+		VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
 
-	m_date_setup_render_pass = GetRenderPass(VK_FORMAT_UNDEFINED, depth_format, VK_ATTACHMENT_LOAD_OP_LOAD,
+	// Stencil DATE only runs on depth that has stencil.
+	m_date_setup_render_pass = GetRenderPass(VK_FORMAT_UNDEFINED, s8_format, VK_ATTACHMENT_LOAD_OP_LOAD,
 		VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
 		m_features.stencil_buffer ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 		m_features.stencil_buffer ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE);
@@ -6678,6 +6822,7 @@ bool GSDeviceVK::CompileConvertPipelines()
 	gpb.SetVertexShader(vs);
 
 	m_convert.resize(ShaderConvertSelector::NUM_TOTAL_SHADERS);
+	m_convert_s8.resize(ShaderConvertSelector::NUM_TOTAL_SHADERS);
 	for (u32 i = 0; i < ShaderConvertSelector::NUM_TOTAL_SHADERS; i++)
 	{
 		const ShaderConvertSelector shader = ShaderConvertSelector::Get(i);
@@ -6752,17 +6897,25 @@ bool GSDeviceVK::CompileConvertPipelines()
 			shader.Name(), shader.Mask(), static_cast<int>(shader.DepthOutput()),
 			static_cast<int>(shader.Biln()));
 
+		if (m_features.stencil_on_request && shader.DepthOutput() && !shader.DATMConvertShader())
+		{
+			gpb.SetRenderPass(m_utility_depth_s8_render_pass_load, 0);
+			m_convert_s8[i] = gpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(true), false);
+			if (!m_convert_s8[i])
+				return false;
+		}
+
 		if (shader.Shader() == ShaderConvert::COLCLIP_INIT || shader.Shader() == ShaderConvert::COLCLIP_RESOLVE)
 		{
 			const bool is_setup = shader.Shader() == ShaderConvert::COLCLIP_INIT;
-			VkPipeline(&arr)[2][2] = *(is_setup ? &m_colclip_setup_pipelines : &m_colclip_finish_pipelines);
-			for (u32 ds = 0; ds < 2; ds++)
+			VkPipeline(&arr)[3][2] = *(is_setup ? &m_colclip_setup_pipelines : &m_colclip_finish_pipelines);
+			for (u32 ds = 0; ds < (m_features.stencil_on_request ? 3u : 2u); ds++)
 			{
 				for (u32 fbl = 0; fbl < 2; fbl++)
 				{
 					pxAssert(!arr[ds][fbl]);
 
-					gpb.SetRenderPass(GetTFXRenderPass(true, ds != 0, is_setup, false, fbl != 0, false,
+					gpb.SetRenderPass(GetTFXRenderPass(true, ds, is_setup, false, fbl != 0, false,
 						VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE),
 						0);
 					// The feedback-loop (fbl) render pass carries the RASTERIZATION_ORDER_ATTACHMENT subpass flag
@@ -7657,13 +7810,21 @@ bool GSDeviceVK::DoSGSR(GSTexture* sTex, GSTexture* dTex, const std::array<u32, 
 	return true;
 }
 
+// Generation of the TFX pipelines: raised whenever they are destroyed, so that an entry's remembered pipeline from an
+// earlier device or an earlier set of pipelines is never bound. A zeroed cache (generation 0) never matches.
+static u32 s_row_cache_gen = 1;
+
 void GSDeviceVK::DestroyResources()
 {
+	s_row_cache_gen++;
 	// Before anything a worker reads is destroyed.
 	StopPipelinePrecompile();
 	m_compile_queue.Stop();
 
-	m_runs.reset();
+	if (m_emitter)
+		m_emitter->Drop();
+	m_rows_defer = false;
+	m_emitter.reset();
 
 	if (m_tfx_ubo_descriptor_set != VK_NULL_HANDLE)
 		FreePersistentDescriptorSet(m_tfx_ubo_descriptor_set);
@@ -7695,7 +7856,12 @@ void GSDeviceVK::DestroyResources()
 		if (pipe != VK_NULL_HANDLE)
 			vkDestroyPipeline(m_device, pipe, nullptr);
 	}
-	for (u32 ds = 0; ds < 2; ds++)
+	for (const auto& pipe : m_convert_s8)
+	{
+		if (pipe != VK_NULL_HANDLE)
+			vkDestroyPipeline(m_device, pipe, nullptr);
+	}
+	for (u32 ds = 0; ds < 3; ds++)
 	{
 		for (u32 fbl = 0; fbl < 2; fbl++)
 		{
@@ -8006,12 +8172,13 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 	if (IsDATEModePrimIDInit(p.ps.date))
 	{
 		// DATE image prepass
+		pxAssert(DepthSlot(p) < 2); // primitive-ID DATE never runs on depth made for stencil
 		gpb.SetRenderPass(m_primid_image_setup_render_passes[p.ds][0], 0);
 	}
 	else
 	{
 		gpb.SetRenderPass(
-			GetTFXRenderPass(p.rt, p.ds, p.ps.colclip_hw, p.dss.date,
+			GetTFXRenderPass(p.rt, DepthSlot(p), p.ps.colclip_hw, p.dss.date,
 				p.IsRTFeedbackLoop(), p.IsTestingAndSamplingDepth(),
 				p.rt ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 				p.ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE),
@@ -8273,9 +8440,10 @@ bool GSDeviceVK::IsLoadableTFXKey(const PipelineSelector& p)
 	if (std::any_of(std::begin(tail), std::end(tail), [](u8 b) { return b != 0; }))
 		return false;
 
-	// The flag word holds topology (2 bits), rt, ds, line_width, feedback_loop_flags (3), raster_order and
-	// stencil_counter (2): eleven bits, and stencil_counter goes to 2. The vertex selector uses nine bits.
-	return p.topology <= static_cast<u32>(GSHWDrawConfig::Topology::Triangle) && (p.key >> 11) == 0 &&
+	// The flag word holds topology (2 bits), rt, ds, line_width, feedback_loop_flags (3), raster_order,
+	// stencil_counter (2) and TFX_KEY_DS_STENCIL: twelve bits, and stencil_counter goes to 2. The vertex selector uses
+	// nine bits.
+	return p.topology <= static_cast<u32>(GSHWDrawConfig::Topology::Triangle) && (p.key >> 12) == 0 &&
 		   p.stencil_counter <= 2 && (p.vs.key >> 9) == 0 && p.bs.op <= GSDevice::OP_REV_SUBTRACT &&
 		   p.vs.expand <= GSHWDrawConfig::VSExpand::TriangleAA1 && p.dss._free == 0 &&
 		   p.cms._free == 0 && p.ps.atst <= GSShader::PS_ATST::NOTEQUAL && p.ps.afail <= GSShader::PS_AFAIL::RGB_ONLY_SW_Z &&
@@ -8469,11 +8637,195 @@ bool GSDeviceVK::BindDrawPipeline(const PipelineSelector& p)
 		return false;
 
 	SetPipeline(pipeline);
+	NoteRunPipeline(p);
 
 	if (!ApplyTFXState())
 		return false;
 
 	return true;
+}
+
+// Whether the next TFX draw can join the driver's run, from its pipeline selector: no vertex expansion (those
+// draws take push constants), no storage-image slots, and the sampled slots the fragment shader declares
+// (tfx.glsl: Texture and Palette under NEEDS_TEX, RtSampler and DepthSampler under the feedback conditions,
+// PrimMinTexture under PS_DATE).
+bool GSDeviceVK::RunGroupFits(const PipelineSelector& p, u32& mask) const
+{
+	if (!m_cmd_draw_run || !m_use_push_descriptors || UseInputAttachmentDescriptors() ||
+		p.vs.expand != GSHWDrawConfig::VSExpand::None || p.ps.HasColorROV() || p.ps.HasDepthROV())
+		return false;
+	// A draw that declares its feedback loop after its pipeline bind (DeclareDrawFeedbackLoop) records that call
+	// between its state and its draw, which would give the group back to the ordinary calls after it was built.
+	if (m_declare_loop_per_draw && (p.IsRTFeedbackLoop() || p.IsTestingAndSamplingDepth()))
+		return false;
+	mask = 0;
+	if (p.ps.tfx != 4)
+		mask |= (1u << TFX_TEXTURE_TEXTURE) | (1u << TFX_TEXTURE_PALETTE);
+	if (p.ps.IsFeedbackLoopRT() || p.IsRTFeedbackLoop())
+		mask |= (1u << TFX_TEXTURE_RT);
+	if (p.ps.date > 0)
+		mask |= (1u << TFX_TEXTURE_PRIMID);
+	if (p.ps.IsFeedbackLoopDepth() || p.IsTestingAndSamplingDepth())
+		mask |= (1u << TFX_TEXTURE_DEPTH);
+	return true;
+}
+
+void GSDeviceVK::NoteRunPipeline(const PipelineSelector& p)
+{
+	m_run_want = RunGroupFits(p, m_run_want_mask);
+}
+
+void GSDeviceVK::AppendRunGroup(VkPipeline pipeline, u32 mask, GSTextureVK* const* textures, VkSampler sampler,
+	VkDescriptorSet set0, const u32* dyn_offsets, u32 first_index, u32 index_count, s32 vertex_offset, u8 blend_constant,
+	const GSVector4i& scissor, u32 ordinary_flags)
+{
+	if (!m_run_groups.empty() && set0 != m_run_set0)
+		FlushRun();
+	m_run_set0 = set0;
+	u32 state = static_cast<u32>(m_run_states.size());
+	for (u32 i = state, seen = 0; i > 0 && seen < 8; i--, seen++)
+	{
+		if (m_run_states[i - 1].pipeline == pipeline && m_run_states[i - 1].tex_mask == mask)
+		{
+			state = i - 1;
+			break;
+		}
+	}
+	if (state == m_run_states.size())
+		m_run_states.push_back({pipeline, mask, 0});
+
+	DrawRunGroup& g = m_run_groups.emplace_back();
+	g.state = state;
+	g.tex_first = static_cast<u32>(m_run_textures.size());
+	for (u32 bits = mask; bits != 0; bits &= bits - 1)
+	{
+		const u32 b = static_cast<u32>(std::countr_zero(bits));
+		m_run_textures.push_back({textures[b]->GetView(), b == TFX_TEXTURE_TEXTURE ? sampler : VK_NULL_HANDLE});
+		m_run_texture_objs.push_back(textures[b]);
+	}
+	m_run_group_flags.push_back(ordinary_flags);
+	g.first_index = first_index;
+	g.index_count = index_count;
+	g.vertex_offset = vertex_offset;
+	g.dyn_offset[0] = dyn_offsets[0];
+	g.dyn_offset[1] = dyn_offsets[1];
+	g.blend_constant = static_cast<float>(blend_constant) / 128.0f;
+	g.scissor = {{scissor.x, scissor.y}, {static_cast<u32>(scissor.width()), static_cast<u32>(scissor.height())}};
+	if (m_run_groups.size() >= DRAW_RUN_MAX_GROUPS)
+		FlushRun();
+}
+
+// One group written by ApplyTFXState, through the ordinary calls it owed when its state was taken. It pushes the
+// texture bindings `textures_owed` gives it (GSShortRunTextures.h).
+void GSDeviceVK::EmitRunGroupOrdinary(u32 i, VkCommandBuffer cmdbuf, GSShortRunTextures& textures_owed)
+{
+	const DrawRunGroup& g = m_run_groups[i];
+	const DrawRunState& s = m_run_states[g.state];
+	const u32 flags = m_run_group_flags[i];
+	if (flags & DIRTY_FLAG_TFX_UBO)
+	{
+		vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout, 0, 1, &m_run_set0,
+			NUM_TFX_DYNAMIC_OFFSETS, g.dyn_offset);
+	}
+	const u32 push = textures_owed.Push(flags & DIRTY_FLAG_TFX_TEXTURES, s.tex_mask);
+	if (push)
+	{
+		// Only the pushed bindings are read; the group's textures are in binding order, one for each bit of tex_mask.
+		std::array<GSTextureVK*, NUM_TFX_TEXTURES> textures{};
+		VkSampler sampler = VK_NULL_HANDLE;
+		for (u32 bits = push; bits != 0; bits &= bits - 1)
+		{
+			const u32 b = static_cast<u32>(std::countr_zero(bits));
+			const u32 k = g.tex_first + static_cast<u32>(std::popcount(s.tex_mask & ((1u << b) - 1)));
+			textures[b] = m_run_texture_objs[k];
+			if (b == TFX_TEXTURE_TEXTURE)
+				sampler = m_run_textures[k].sampler;
+		}
+		Vulkan::DescriptorSetUpdateBuilder dsub;
+		AddTFXTextureWrites(dsub, VK_NULL_HANDLE, textures, sampler, push);
+		dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout, TFX_DESCRIPTOR_SET_TEXTURES);
+	}
+	if (flags & DIRTY_FLAG_PIPELINE)
+		vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipeline);
+	if (flags & DIRTY_FLAG_SCISSOR)
+		vkCmdSetScissor(cmdbuf, 0, 1, &g.scissor);
+	if (flags & DIRTY_FLAG_BLEND_CONSTANTS)
+	{
+		const GSVector4 col(g.blend_constant);
+		vkCmdSetBlendConstants(cmdbuf, col.v);
+	}
+	vkCmdDrawIndexed(cmdbuf, g.index_count, 1, g.first_index, g.vertex_offset, 0);
+}
+
+// The binding numbers and texture flags GSShortRunTextures and its tests use are these.
+static_assert(GSShortRunTextures::TEXTURE == GSDeviceVK::TFX_TEXTURE_TEXTURE &&
+			  GSShortRunTextures::PALETTE == GSDeviceVK::TFX_TEXTURE_PALETTE &&
+			  GSShortRunTextures::RT == GSDeviceVK::TFX_TEXTURE_RT &&
+			  GSShortRunTextures::PRIMID == GSDeviceVK::TFX_TEXTURE_PRIMID &&
+			  GSShortRunTextures::DEPTH == GSDeviceVK::TFX_TEXTURE_DEPTH &&
+			  GSShortRunTextures::RT_ROV == GSDeviceVK::TFX_TEXTURE_RT_ROV &&
+			  GSShortRunTextures::DEPTH_ROV == GSDeviceVK::TFX_TEXTURE_DEPTH_ROV &&
+			  GSShortRunTextures::BINDINGS == GSDeviceVK::NUM_TFX_TEXTURES);
+
+// Records the waiting groups: a run of one or two groups with the ordinary calls, a longer one through the driver's
+// run entry. A group whose draw has not come yet (something used the command buffer between ApplyTFXState and the
+// draw) gives its state to the ordinary calls instead.
+//
+// This usually runs inside the next draw's ApplyTFXState, after that draw has read its flags. So when it returns, set 1
+// holds m_tfx_textures and m_tfx_sampler for every binding whose flag is clear, without the next draw's help: what the
+// groups left unknown is pushed here (GSShortRunTextures.h).
+void GSDeviceVK::FlushRun()
+{
+	static_assert(DIRTY_FLAG_TFX_TEXTURE_0 == 1u && DIRTY_FLAG_TFX_TEXTURES == GSShortRunTextures::ALL);
+	const VkCommandBuffer cmdbuf = m_current_command_buffer;
+	u32 pushed = 0;
+	if (!m_run_groups.empty())
+	{
+		// Only a push-descriptor device takes groups (RunGroupFits).
+		pxAssert(m_use_push_descriptors);
+		if (m_run_groups.size() < DRAW_RUN_MIN_GROUPS &&
+			std::find(m_run_group_flags.begin(), m_run_group_flags.end(), ~0u) == m_run_group_flags.end())
+		{
+			GSShortRunTextures owed;
+			for (u32 i = 0; i < m_run_groups.size(); i++)
+				EmitRunGroupOrdinary(i, cmdbuf, owed);
+			pushed = owed.Finish();
+		}
+		else
+		{
+			DrawRun run;
+			run.size = sizeof(run);
+			run.abi = DRAW_RUN_ABI;
+			run.group_count = static_cast<u32>(m_run_groups.size());
+			run.reserved = 0;
+			run.layout = m_tfx_pipeline_layout;
+			run.set0 = m_run_set0;
+			run.states = m_run_states.data();
+			run.groups = m_run_groups.data();
+			run.textures = m_run_textures.data();
+			m_cmd_draw_run(cmdbuf, &run);
+			// The entry leaves the last group's pipeline, scissor, blend constants and set 0 bound, which is what this
+			// device's cached state and the held twins' bind record already say. Set 1 is unknown.
+			pushed = GSShortRunTextures::AfterEntry();
+		}
+		m_run_states.clear();
+		m_run_groups.clear();
+		m_run_textures.clear();
+		m_run_texture_objs.clear();
+		m_run_group_flags.clear();
+		m_raw_binds.Forget(GSRawBindCache::TEXTURES);
+		if (pushed)
+		{
+			Vulkan::DescriptorSetUpdateBuilder dsub;
+			AddTFXTextureWrites(dsub, VK_NULL_HANDLE, m_tfx_textures, m_tfx_sampler, pushed);
+			dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout, TFX_DESCRIPTOR_SET_TEXTURES);
+		}
+	}
+	if (m_run_group_open)
+	{
+		m_run_group_open = false;
+		EmitTFXState(m_run_open_flags & ~pushed, cmdbuf);
+	}
 }
 
 void GSDeviceVK::InitializeState()
@@ -8542,8 +8894,10 @@ void GSDeviceVK::OnStreamRingReplaced(const VKStreamBuffer& ring)
 	pxAssert(&ring == &m_vertex_stream_buffer);
 
 	// Draws already recorded keep the old buffer, which retires with this command buffer. Later
-	// draws, in this command buffer and every one after it, bind the new one.
-	SetInitialState(m_current_command_buffer);
+	// draws, in this command buffer and every one after it, bind the new one. The groups waiting for
+	// the driver's run entry draw from the vertex buffer bound when they are recorded, and their
+	// vertex offsets are in the old buffer, so they are recorded first, with the old buffer bound.
+	SetInitialState(GetCurrentCommandBuffer());
 
 	if (m_features.vs_expand)
 	{
@@ -8588,7 +8942,8 @@ void GSDeviceVK::ExecuteCommandBuffer(bool wait_for_completion, const char* reas
 
 void GSDeviceVK::ExecuteCommandBufferAndRestartRenderPass(bool wait_for_completion, const char* reason)
 {
-	Console.Warning("VK: Executing command buffer due to '%s'", reason);
+	if (reason)
+		Console.Warning("VK: Executing command buffer due to '%s'", reason);
 
 	const VkRenderPass render_pass = m_current_render_pass;
 	const GSVector4i render_pass_area = m_current_render_pass_area;
@@ -8723,6 +9078,7 @@ void GSDeviceVK::ExecuteCommandBufferForReadback()
 
 void GSDeviceVK::InvalidateCachedState()
 {
+	FlushRun();
 	m_dirty_flags = ALL_DIRTY_STATE;
 	for (u32 i = 0; i < NUM_TFX_TEXTURES; i++)
 		m_tfx_textures[i] = m_null_texture.get();
@@ -8935,8 +9291,8 @@ void GSDeviceVK::SetUtilityTexture(GSTexture* tex, VkSampler sampler)
 
 void GSDeviceVK::SetUtilityPushConstants(const void* data, u32 size)
 {
-	if (m_runs)
-		m_runs->Flush(GSRunsVK::END_OTHER);
+	if (m_emitter)
+		m_emitter->RecordOpen();
 	// Cache so a mid-utility-draw command-buffer rollover can replay these. Ported from sashkinbro/EmuCoreX.
 	pxAssert(size <= m_utility_push_constants.size());
 	std::memcpy(m_utility_push_constants.data(), data, size);
@@ -8947,6 +9303,10 @@ void GSDeviceVK::SetUtilityPushConstants(const void* data, u32 size)
 
 void GSDeviceVK::UnbindTexture(GSTextureVK* tex)
 {
+	// The groups waiting for the driver's run entry keep the textures they sample, and the ordinary
+	// calls read those objects when the groups are recorded.
+	if (!m_run_groups.empty() || m_run_group_open)
+		FlushRun();
 	for (u32 i = 0; i < NUM_TFX_TEXTURES; i++)
 	{
 		if (m_tfx_textures[i] == tex)
@@ -9051,10 +9411,8 @@ void GSDeviceVK::EndRenderPass()
 	if (m_current_render_pass == VK_NULL_HANDLE)
 		return;
 
-	if (m_runs)
-	{
-		m_runs->Flush(GSRunsVK::END_PASS);
-	}
+	// Every row pending was decided for this pass: it is recorded in it, and the base is forgotten (GSRowEmitter.h).
+	FlushDeferredRows();
 
 	m_current_render_pass = VK_NULL_HANDLE;
 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
@@ -9135,14 +9493,72 @@ __ri void GSDeviceVK::ApplyBaseState(u32 flags, VkCommandBuffer cmdbuf)
 		vkCmdSetLineWidth(cmdbuf, m_current_line_width);
 }
 
+void GSDeviceVK::AddTFXTextureWrites(Vulkan::DescriptorSetUpdateBuilder& dsub, VkDescriptorSet ds,
+	const std::array<GSTextureVK*, NUM_TFX_TEXTURES>& textures, VkSampler sampler, u32 flags) const
+{
+	if (flags & DIRTY_FLAG_TFX_TEXTURE_TEX)
+	{
+		dsub.AddCombinedImageSamplerDescriptorWrite(ds, TFX_TEXTURE_TEXTURE,
+			textures[TFX_TEXTURE_TEXTURE]->GetView(), sampler,
+			textures[TFX_TEXTURE_TEXTURE]->GetVkLayout());
+	}
+	if (flags & DIRTY_FLAG_TFX_TEXTURE_PALETTE)
+	{
+		dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_PALETTE,
+			textures[TFX_TEXTURE_PALETTE]->GetView(), textures[TFX_TEXTURE_PALETTE]->GetVkLayout());
+	}
+	if (flags & DIRTY_FLAG_TFX_TEXTURE_RT)
+	{
+		if (UseInputAttachmentDescriptors())
+		{
+			dsub.AddInputAttachmentDescriptorWrite(
+				ds, TFX_TEXTURE_RT, textures[TFX_TEXTURE_RT]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
+		}
+		else
+		{
+			dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_RT, textures[TFX_TEXTURE_RT]->GetView(),
+				textures[TFX_TEXTURE_RT]->GetVkLayout());
+		}
+	}
+	if (flags & DIRTY_FLAG_TFX_TEXTURE_PRIMID)
+	{
+		dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_PRIMID,
+			textures[TFX_TEXTURE_PRIMID]->GetView(), textures[TFX_TEXTURE_PRIMID]->GetVkLayout());
+	}
+	if (flags & DIRTY_FLAG_TFX_TEXTURE_DEPTH)
+	{
+		if (UseInputAttachmentDescriptors())
+		{
+			dsub.AddInputAttachmentDescriptorWrite(
+				ds, TFX_TEXTURE_DEPTH, textures[TFX_TEXTURE_DEPTH]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
+		}
+		else
+		{
+			dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_DEPTH, textures[TFX_TEXTURE_DEPTH]->GetView(),
+				textures[TFX_TEXTURE_DEPTH]->GetVkLayout());
+		}
+	}
+	if (flags & DIRTY_FLAG_TFX_TEXTURE_RT_ROV)
+	{
+		dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_RT_ROV, textures[TFX_TEXTURE_RT_ROV]->GetView(),
+			textures[TFX_TEXTURE_RT_ROV]->GetVkLayout(), true);
+	}
+	if (flags & DIRTY_FLAG_TFX_TEXTURE_DEPTH_ROV)
+	{
+		dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_DEPTH_ROV, textures[TFX_TEXTURE_DEPTH_ROV]->GetView(),
+			textures[TFX_TEXTURE_DEPTH_ROV]->GetVkLayout(), true);
+	}
+}
+
 bool GSDeviceVK::ApplyTFXState(bool already_execed)
 {
-	if (m_runs)
-		m_runs->Flush(GSRunsVK::END_OTHER);
-	if (m_current_pipeline_layout == PipelineLayout::TFX && m_dirty_flags == 0)
+	if (m_emitter)
+		m_emitter->RecordOpen();
+	// A draw for the driver's run carries its whole state in its group, so it is taken even with nothing dirty.
+	const bool run = std::exchange(m_run_want, false) && m_current_line_width == 1.0f;
+	if (!run && m_current_pipeline_layout == PipelineLayout::TFX && m_dirty_flags == 0)
 		return true;
 
-	const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
 	u32 flags = m_dirty_flags;
 	m_dirty_flags &= ~(DIRTY_TFX_STATE | DIRTY_CONSTANT_BUFFER_STATE | DIRTY_FLAG_TFX_UBO);
 
@@ -9189,7 +9605,6 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		flags |= DIRTY_FLAG_TFX_UBO;
 	}
 
-	Vulkan::DescriptorSetUpdateBuilder dsub;
 	if (m_current_pipeline_layout != PipelineLayout::TFX)
 	{
 		m_current_pipeline_layout = PipelineLayout::TFX;
@@ -9206,6 +9621,53 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		}
 	}
 
+	if (run)
+	{
+		// The index buffer, viewport and line width still go through their own calls (which first record the groups
+		// before this one); everything else is the group's, completed by the draw. Push constants are for vertex
+		// expansion, which a run's pipeline never uses: they stay owed to the next ordinary draw.
+		const u32 ordinary = flags & (DIRTY_FLAG_INDEX_BUFFER | DIRTY_FLAG_VIEWPORT | DIRTY_FLAG_LINE_WIDTH);
+		m_dirty_flags &= ~ordinary;
+		if (ordinary)
+			ApplyBaseState(ordinary, GetCurrentCommandBuffer());
+		m_dirty_flags |= flags & DIRTY_FLAG_VS_PUSH_CONSTANTS;
+		if (flags & DIRTY_FLAG_PIPELINE)
+			g_perfmon.Put(GSPerfMon::PipelineSwitches, 1);
+		m_run_open_flags = flags & ~(ordinary | DIRTY_FLAG_VS_PUSH_CONSTANTS);
+		m_run_open_mask = m_run_want_mask;
+		m_run_group_open = true;
+		return true;
+	}
+
+	const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
+	if ((flags & DIRTY_FLAG_TFX_TEXTURES) && !m_use_push_descriptors)
+	{
+		const VkDescriptorSet ds = AllocateDescriptorSetFromFramePool(m_tfx_texture_ds_layout);
+		if (ds == VK_NULL_HANDLE) [[unlikely]]
+		{
+			if (already_execed)
+			{
+				Console.Error("VK: Failed to allocate TFX texture descriptor set");
+				return false;
+			}
+
+			// Frame descriptor pool exhausted — flush to reset it, then restart
+			// the render pass and re-apply all state on the fresh command buffer.
+			ExecuteCommandBufferAndRestartRenderPass(false, "Out of TFX texture descriptors");
+			return ApplyTFXState(true);
+		}
+		m_tfx_texture_descriptor_set = ds;
+	}
+
+	EmitTFXState(flags, cmdbuf);
+	return true;
+}
+
+// The ordinary Vulkan calls for the TFX state named by `flags`. Without push descriptors the caller has put a
+// fresh texture set in m_tfx_texture_descriptor_set when a texture flag is set.
+void GSDeviceVK::EmitTFXState(u32 flags, VkCommandBuffer cmdbuf)
+{
+	Vulkan::DescriptorSetUpdateBuilder dsub;
 	if (flags & DIRTY_FLAG_TFX_UBO)
 	{
 		// Still need to bind the UBO descriptor set.
@@ -9227,74 +9689,10 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		if (!m_use_push_descriptors)
 		{
 			flags |= DIRTY_FLAG_TFX_TEXTURES;
-			ds = AllocateDescriptorSetFromFramePool(m_tfx_texture_ds_layout);
-			if (ds == VK_NULL_HANDLE) [[unlikely]]
-			{
-				if (already_execed)
-				{
-					Console.Error("VK: Failed to allocate TFX texture descriptor set");
-					return false;
-				}
-
-				// Frame descriptor pool exhausted — flush to reset it, then restart
-				// the render pass and re-apply all state on the fresh command buffer.
-				ExecuteCommandBufferAndRestartRenderPass(false, "Out of TFX texture descriptors");
-				return ApplyTFXState(true);
-			}
+			ds = m_tfx_texture_descriptor_set;
 		}
 
-		if (flags & DIRTY_FLAG_TFX_TEXTURE_TEX)
-		{
-			dsub.AddCombinedImageSamplerDescriptorWrite(ds, TFX_TEXTURE_TEXTURE,
-				m_tfx_textures[TFX_TEXTURE_TEXTURE]->GetView(), m_tfx_sampler,
-				m_tfx_textures[TFX_TEXTURE_TEXTURE]->GetVkLayout());
-		}
-		if (flags & DIRTY_FLAG_TFX_TEXTURE_PALETTE)
-		{
-			dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_PALETTE,
-				m_tfx_textures[TFX_TEXTURE_PALETTE]->GetView(), m_tfx_textures[TFX_TEXTURE_PALETTE]->GetVkLayout());
-		}
-		if (flags & DIRTY_FLAG_TFX_TEXTURE_RT)
-		{
-			if (UseInputAttachmentDescriptors())
-			{
-				dsub.AddInputAttachmentDescriptorWrite(
-					ds, TFX_TEXTURE_RT, m_tfx_textures[TFX_TEXTURE_RT]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
-			}
-			else
-			{
-				dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_RT, m_tfx_textures[TFX_TEXTURE_RT]->GetView(),
-					m_tfx_textures[TFX_TEXTURE_RT]->GetVkLayout());
-			}
-		}
-		if (flags & DIRTY_FLAG_TFX_TEXTURE_PRIMID)
-		{
-			dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_PRIMID,
-				m_tfx_textures[TFX_TEXTURE_PRIMID]->GetView(), m_tfx_textures[TFX_TEXTURE_PRIMID]->GetVkLayout());
-		}
-		if (flags & DIRTY_FLAG_TFX_TEXTURE_DEPTH)
-		{
-			if (UseInputAttachmentDescriptors())
-			{
-				dsub.AddInputAttachmentDescriptorWrite(
-					ds, TFX_TEXTURE_DEPTH, m_tfx_textures[TFX_TEXTURE_DEPTH]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
-			}
-			else
-			{
-				dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_DEPTH, m_tfx_textures[TFX_TEXTURE_DEPTH]->GetView(),
-					m_tfx_textures[TFX_TEXTURE_DEPTH]->GetVkLayout());
-			}
-		}
-		if (flags & DIRTY_FLAG_TFX_TEXTURE_RT_ROV)
-		{
-			dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_RT_ROV, m_tfx_textures[TFX_TEXTURE_RT_ROV]->GetView(),
-				m_tfx_textures[TFX_TEXTURE_RT_ROV]->GetVkLayout(), true);
-		}
-		if (flags & DIRTY_FLAG_TFX_TEXTURE_DEPTH_ROV)
-		{
-			dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_DEPTH_ROV, m_tfx_textures[TFX_TEXTURE_DEPTH_ROV]->GetView(),
-				m_tfx_textures[TFX_TEXTURE_DEPTH_ROV]->GetVkLayout(), true);
-		}
+		AddTFXTextureWrites(dsub, ds, m_tfx_textures, m_tfx_sampler, flags);
 
 		if (m_use_push_descriptors)
 		{
@@ -9309,13 +9707,12 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 	}
 
 	ApplyBaseState(flags, cmdbuf);
-	return true;
 }
 
 bool GSDeviceVK::ApplyUtilityState(bool already_execed)
 {
-	if (m_runs)
-		m_runs->Flush(GSRunsVK::END_OTHER);
+	if (m_emitter)
+		m_emitter->RecordOpen();
 	// A utility draw into the open pass (a stretch onto the target it is already bound to) writes
 	// the target the kept copy describes.
 	if (m_run_snapshot.tex && m_current_render_target == m_run_snapshot.rt)
@@ -9380,8 +9777,8 @@ void GSDeviceVK::SetPSConstantBuffer(const GSHWDrawConfig::PSConstantBuffer& cb)
 
 void GSDeviceVK::SetVSPushConstants(u32 base_vertex, u32 base_index, bool force_update)
 {
-	if (m_runs)
-		m_runs->Flush(GSRunsVK::END_OTHER);
+	if (m_emitter)
+		m_emitter->RecordOpen();
 	GSHWDrawConfig::VSPushConstants pc;
 	pc.base_vertex = base_vertex;
 	pc.base_index = base_index;
@@ -9467,7 +9864,9 @@ bool GSDeviceVK::DrawStencilCounter(GSHWDrawConfig& config)
 
 	// Temporaries first, so that failing to make one leaves the colour road with nothing changed.
 	GSTextureVK* ds = static_cast<GSTextureVK*>(config.ds);
-	GSTextureVK* const temp_ds = ds ? nullptr : static_cast<GSTextureVK*>(CreateDepthStencil(rtsize, false, true));
+	if (ds && !ds->HasStencilAspect())
+		return false;
+	GSTextureVK* const temp_ds = ds ? nullptr : static_cast<GSTextureVK*>(CreateDepthStencil(rtsize, false, true, true));
 	if (!ds && !temp_ds)
 		return false;
 	if (temp_ds)
@@ -9529,6 +9928,7 @@ bool GSDeviceVK::DrawStencilCounter(GSHWDrawConfig& config)
 	pipe.cms.wa = writes_alpha;
 	pipe.rt = writes_alpha;
 	pipe.ds = true;
+	SetDepthStencilSlot(pipe, IsStencilSlot(ds));
 	pipe.dss.zwe = 0;
 	pipe.dss.date = 0;
 	pipe.dss.date_one = 0;
@@ -9554,8 +9954,8 @@ bool GSDeviceVK::DrawStencilCounter(GSHWDrawConfig& config)
 		const VkClearAttachment ca = {VK_IMAGE_ASPECT_STENCIL_BIT, 0u, {.depthStencil = {0.0f, 0u}}};
 		const VkClearRect rc = {{{area.left, area.top}, {static_cast<u32>(area.width()), static_cast<u32>(area.height())}},
 			0u, 1u};
-		if (m_runs)
-			m_runs->Flush(GSRunsVK::END_OTHER);
+		if (m_emitter)
+			m_emitter->RecordOpen();
 		vkCmdClearAttachments(GetCurrentCommandBuffer(), 1, &ca, 1, &rc);
 	}
 
@@ -9762,34 +10162,11 @@ bool GSDeviceVK::DateCopyLive(const GSHWDrawConfig& config)
 
 void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 {
-	// What the draw writes makes those bits of the kept target copy stale (GSRunSnapshot.h). Here,
-	// because a draw the run machine merges returns below. The draw's own decision reads the set
-	// as it stood before.
+	// What the draw writes makes those bits of the kept target copy stale (GSRunSnapshot.h). The draw's own decision
+	// reads the set as it stood before.
 	const u8 snapshot_stale = m_run_snapshot.stale;
 	if (m_run_snapshot.tex)
 		m_run_snapshot.stale |= GSRunSnapshot::DrawWrites(config);
-
-	// The run machine (GSRunsVK.h) decides whether this draw can join a run, and ends the open run if not, before
-	// anything below records a command.
-	if (m_runs)
-	{
-		m_runs->Classify(config);
-		// A draw that continues the open run skips the rest. Of what it skips, only this has an effect a merged draw
-		// shares: it writes alpha, so the shared DATE stencil copy is no longer true.
-		if (m_runs->Candidate())
-		{
-			const bool date_copy_valid = m_date_copy.valid;
-			if (date_copy_valid && config.colormask.wa)
-				m_date_copy.valid = false;
-			if (m_runs->Continue(config))
-			{
-				// Still a draw waiting for the next submit, for the in-pass kick below.
-				m_draws_since_submit++;
-				return;
-			}
-			m_date_copy.valid = date_copy_valid;
-		}
-	}
 
 	// Mid-frame kick (see m_render_passes_since_submit in the header): while a
 	// readback-prone frame is recording, submit the work recorded so far once enough of it has
@@ -9861,10 +10238,20 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		const u32 next_buffer = (m_current_frame + 1) % NUM_COMMAND_BUFFERS;
 		if (m_frame_resources[next_buffer].fence_counter <= m_completed_fence_counter)
 		{
-			// Submitting does not close an open pass, and this one ends at this draw anyway.
 			const u64 kick_start = GetCPUTicks();
-			EndRenderPass();
-			ExecuteCommandBuffer(WaitType::None);
+			if (at_pass_boundary)
+			{
+				// Submitting does not close an open pass, and this one ends at this draw anyway.
+				EndRenderPass();
+				ExecuteCommandBuffer(WaitType::None);
+			}
+			else
+			{
+				// The draw continues the open pass, so the pass is begun again on the same targets after the submit: the
+				// draws after this one find the pass they would have found without the kick. The kick is decided from
+				// measured times, and the row emitter's decisions read the pass (RowIsPlain), so it must not change it.
+				ExecuteCommandBufferAndRestartRenderPass(false, nullptr);
+			}
 			NoteKick(GetCPUTicks() - kick_start);
 		}
 		else if (kick_in_pass)
@@ -9995,7 +10382,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 				if (draw_ds)
 					cvs[cv_count++].depthStencil = {draw_ds->GetClearDepth(), 1};
 
-				BeginClearRenderPass(GetTFXRenderPass(true, pipe.ds, false, false, pipe.IsRTFeedbackLoop(),
+				BeginClearRenderPass(GetTFXRenderPass(true, DepthSlot(pipe), false, false, pipe.IsRTFeedbackLoop(),
 										 pipe.IsTestingAndSamplingDepth(), VK_ATTACHMENT_LOAD_OP_CLEAR,
 										 pipe.ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE),
 					draw_rt->GetRect(), cvs, cv_count);
@@ -10003,7 +10390,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 			}
 			else
 			{
-				BeginRenderPass(GetTFXRenderPass(true, pipe.ds, false, false, pipe.IsRTFeedbackLoop(),
+				BeginRenderPass(GetTFXRenderPass(true, DepthSlot(pipe), false, false, pipe.IsRTFeedbackLoop(),
 									pipe.IsTestingAndSamplingDepth(), VK_ATTACHMENT_LOAD_OP_LOAD,
 									pipe.ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE),
 					draw_rt->GetRect());
@@ -10011,7 +10398,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 
 			const GSVector4 drawareaf = GSVector4(config.colclip_update_area);
 			const GSVector4 sRect(drawareaf / GSVector4(rtsize).xyxy());
-			SetPipeline(m_colclip_finish_pipelines[pipe.ds][pipe.IsRTFeedbackLoop()]);
+			SetPipeline(m_colclip_finish_pipelines[DepthSlot(pipe)][pipe.IsRTFeedbackLoop()]);
 			SetUtilityTexture(colclip_rt, m_point_sampler);
 			DrawStretchRect(sRect, drawareaf, rtsize);
 
@@ -10098,7 +10485,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 
 				// If depth is cleared, we need to commit it, because we're only going to draw to the active part of the FB.
 				if (draw_ds && draw_ds->GetState() == GSTexture::State::Cleared && !config.drawarea.eq(GSVector4i::loadh(rtsize)))
-					draw_ds->CommitClear(m_current_command_buffer);
+					draw_ds->CommitClear(GetCurrentCommandBuffer());
 			}
 			else if (draw_rt->GetState() == GSTexture::State::Dirty)
 			{
@@ -10125,7 +10512,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		// DoStretchRect, not StretchRect: the latter flushes deferred draws, and this is one of them.
 		// The depth-output flag is what makes the copy write depth at all.
 		EndRenderPass();
-		native_ds = static_cast<GSTextureVK*>(CreateDepthStencil(draw_size, false, true));
+		native_ds = static_cast<GSTextureVK*>(CreateDepthStencil(draw_size, false, true, full_ds->HasStencilAspect()));
 		if (!native_ds)
 		{
 			Console.Warning("VK: Failed to allocate native-resolution depth buffer, aborting draw.");
@@ -10162,6 +10549,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		{
 			draw_ds = m_current_depth_target;
 			m_pipeline_selector.ds = true;
+			SetDepthStencilSlot(m_pipeline_selector, IsStencilSlot(draw_ds));
 		}
 
 		// Keep the open pass's feedback bits across a run of draws on the same target, as the
@@ -10307,6 +10695,23 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 
 	OMSetRenderTargets(draw_rt, draw_ds, to_draw_size(config.scissor), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 
+	// A pass opened over its draws cannot hold one that reaches outside it, and an open pass cannot be widened, so such a
+	// draw ends it and the pass reopens over the union of the two, or over the whole target the second time.
+	static constexpr u32 MAX_RENDER_AREA_GROWTHS = 1;
+	GSVector4i narrow_area, grown_area;
+	if (m_narrow_render_area) [[unlikely]]
+	{
+		narrow_area = NarrowRenderArea(to_draw_size(config.drawarea), draw_size);
+		grown_area = GSVector4i::zero();
+		if (InRenderPass() && !m_current_render_pass_area.rcontains(narrow_area))
+		{
+			grown_area = (m_render_area_growths < MAX_RENDER_AREA_GROWTHS) ? m_current_render_pass_area.runion(narrow_area) :
+			                                                                  GSVector4i::loadh(draw_size);
+			m_render_area_growths++;
+			EndRenderPass();
+		}
+	}
+
 	// Begin render pass if new target or out of the area.
 	if (!InRenderPass())
 	{
@@ -10319,24 +10724,48 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 			rt_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 		if (pipe.IsDepthFeedbackLoop() && ds_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE)
 			ds_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-		const VkRenderPass rp = GetTFXRenderPass(pipe.rt, pipe.ds, pipe.ps.colclip_hw,
-			config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil, pipe.IsRTFeedbackLoop(),
-			pipe.IsTestingAndSamplingDepth(), rt_op, ds_op);
+		// A stencil-one temporary is cleared over the draw in the pass and read by no later pass, so on the
+		// GPUs that would rather not build one it is neither loaded nor stored, and the pass may narrow.
+		const bool scratch_ds = m_features.date_reads_without_depth && config.ds_scratch && draw_ds == config.ds &&
+			config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::StencilOne;
+		if (scratch_ds)
+			ds_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		const VkRenderPass rp = scratch_ds ?
+			GetRenderPass(draw_rt ? draw_rt->GetVkFormat() : VK_FORMAT_UNDEFINED, draw_ds->GetVkFormat(),
+				draw_rt ? rt_op : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				draw_rt ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				pipe.IsRTFeedbackLoop(), pipe.IsTestingAndSamplingDepth()) :
+			GetTFXRenderPass(pipe.rt, DepthSlot(pipe), pipe.ps.colclip_hw,
+				config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil, pipe.IsRTFeedbackLoop(),
+				pipe.IsTestingAndSamplingDepth(), rt_op, ds_op);
 		const bool is_clearing_rt = (rt_op == VK_ATTACHMENT_LOAD_OP_CLEAR || ds_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
 
 		// Only draw to the active area of the colclip hw target. Except when depth is cleared, we need to use the full
 		// buffer size, otherwise it'll only clear the draw part of the depth buffer.
 		//
-		// A TFX pass is opened at the full render target on purpose. Sizing it to its draws instead
-		// (grow to the union of what it holds, pad 2 px, align to the render-area granularity)
-		// removed 98% of Stuntman's render-pass area and moved GPU time by +0.01%..+0.09% on Apple
-		// silicon, +0.59 ms on a Snapdragon 865, and flat to +40% on a Mali-G615. None of Turnip,
-		// Honeykrisp or the Mali driver charge for render-pass AREA -- each charges roughly 12-34
-		// microseconds per PASS, and a narrower area only forces more of them. Commit f9b5395855 has
-		// the mechanism this reverted, and the measurements behind these numbers.
-		const GSVector4i render_area = (pipe.ps.colclip_hw && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve) && ds_op != VK_ATTACHMENT_LOAD_OP_CLEAR)
+		// A TFX pass is opened at the full render target except where the driver pays for render-pass area
+		// (m_narrow_render_area). Turnip, Honeykrisp and Arm's Mali driver charge roughly 12-34 microseconds per
+		// PASS and nothing for area, so the extra passes a narrow area forces made them slower (commit f9b5395855).
+		// PanVK on Bifrost loads and stores every tile of the area, and there the narrow pass wins.
+		GSVector4i render_area = (pipe.ps.colclip_hw && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve) && ds_op != VK_ATTACHMENT_LOAD_OP_CLEAR)
 		                             ? to_draw_size(config.drawarea)
 		                             : GSVector4i::loadh(draw_size);
+
+		// Over its draws instead, except for a clearing pass (the clear is the load op), colclip (its blit covers the
+		// target) and a DONT_CARE load (narrowing would change which pixels are undefined).
+		if (m_narrow_render_area)
+		{
+			if (!is_clearing_rt && !pipe.ps.colclip_hw && (!draw_rt || rt_op == VK_ATTACHMENT_LOAD_OP_LOAD) &&
+				(!draw_ds || ds_op == VK_ATTACHMENT_LOAD_OP_LOAD || scratch_ds))
+			{
+				const GSVector4i want = grown_area.rempty() ? narrow_area : grown_area;
+				if (!want.rempty())
+					render_area = AlignRenderArea(rp, want, draw_size);
+			}
+			if (grown_area.rempty())
+				m_render_area_growths = 0;
+		}
 
 		if (is_clearing_rt)
 		{
@@ -10364,6 +10793,11 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		}
 	}
 
+	// Nothing may render outside the render area. drawarea already bounds the geometry, so this only turns a wrong
+	// bound into a clip.
+	if (m_narrow_render_area)
+		SetScissor(to_draw_size(config.scissor).rintersect(m_current_render_pass_area));
+
 	// The kept target copy follows the target into the pass this draw opened. Nothing wrote the
 	// target between the pass it was live in and this one: only this function ran, and its setup
 	// draws write depth, stencil and scratch images.
@@ -10377,18 +10811,18 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	if (config.date_copy != GSAlphaBitLogicOp::NoDateCopy && config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil)
 		m_date_copy = {true, config.rt, config.ds, config.datm, m_render_pass_serial};
 
-	// Guard on stencil_buffer: devices without a stencil attachment (e.g. Adreno, forced D32F) have no
-	// stencil aspect to clear.
-	if (config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::StencilOne && m_features.stencil_buffer)
+	// Guard on the stencil aspect: depth without one (Adreno, forced D32F, stencil_on_request) has none to clear.
+	if (config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::StencilOne && config.ds &&
+		static_cast<GSTextureVK*>(config.ds)->HasStencilAspect())
 	{
 		m_date_copy.valid = false;
 		const VkClearAttachment ca = {VK_IMAGE_ASPECT_STENCIL_BIT, 0u, {.depthStencil = {0.0f, 1u}}};
 		const VkClearRect rc = {{{config.drawarea.left, config.drawarea.top},
 									{static_cast<u32>(config.drawarea.width()), static_cast<u32>(config.drawarea.height())}},
 			0u, 1u};
-		if (m_runs)
-			m_runs->Flush(GSRunsVK::END_OTHER);
-		vkCmdClearAttachments(m_current_command_buffer, 1, &ca, 1, &rc);
+		if (m_emitter)
+			m_emitter->RecordOpen();
+		vkCmdClearAttachments(GetCurrentCommandBuffer(), 1, &ca, 1, &rc);
 	}
 
 	// rt -> colclip hw blit if enabled
@@ -10396,7 +10830,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	{
 		OMSetRenderTargets(draw_rt, draw_ds, GSVector4i::loadh(draw_size), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 		SetUtilityTexture(static_cast<GSTextureVK*>(config.rt), m_point_sampler);
-		SetPipeline(m_colclip_setup_pipelines[pipe.ds][pipe.IsRTFeedbackLoop()]);
+		SetPipeline(m_colclip_setup_pipelines[DepthSlot(pipe)][pipe.IsRTFeedbackLoop()]);
 
 		const GSVector4 drawareaf = GSVector4((config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertOnly) ? GSVector4i::loadh(rtsize) : config.drawarea);
 		const GSVector4 sRect(drawareaf / GSVector4(rtsize).xyxy());
@@ -10406,20 +10840,12 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		OMSetRenderTargets(draw_rt, draw_ds, to_draw_size(config.scissor), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 	}
 
-	// A draw the run machine takes writes its own vertices and indices, into its run.
-	const bool in_run =
-		m_runs && m_runs->Candidate() && m_runs->Append(config, pipe.feedback_loop_flags, pipe.ps.colclip_hw, m_tfx_sampler);
-
 	// VB/IB upload, if we did DATE setup and it's not colclip hw this has already been done
-	if (!in_run && (!date_image || colclip_rt))
+	if (!date_image || colclip_rt)
 		UploadHWDrawVerticesAndIndices(config);
 
 	// now we can do the actual draw
-	if (in_run)
-	{
-		// Drawn with its run, as one host draw, when the run ends.
-	}
-	else if (config.colormask.logic_op != GSAlphaBitLogicOp::Off)
+	if (config.colormask.logic_op != GSAlphaBitLogicOp::Off)
 	{
 		// An alpha-bit mark (GSAlphaBitLogicOp.h): one run, or two in submission order when its
 		// primitives set the bit and then clear it (or the reverse), one op each. Nothing reads the
@@ -10532,7 +10958,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 				if (draw_ds)
 					cvs[cv_count++].depthStencil = {draw_ds->GetClearDepth(), 1};
 
-				BeginClearRenderPass(GetTFXRenderPass(true, pipe.ds, false, false, pipe.IsRTFeedbackLoop(),
+				BeginClearRenderPass(GetTFXRenderPass(true, DepthSlot(pipe), false, false, pipe.IsRTFeedbackLoop(),
 										 pipe.IsTestingAndSamplingDepth(), VK_ATTACHMENT_LOAD_OP_CLEAR,
 										 pipe.ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE),
 					draw_rt->GetRect(), cvs, cv_count);
@@ -10540,7 +10966,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 			}
 			else
 			{
-				BeginRenderPass(GetTFXRenderPass(true, pipe.ds, false, false, pipe.IsRTFeedbackLoop(),
+				BeginRenderPass(GetTFXRenderPass(true, DepthSlot(pipe), false, false, pipe.IsRTFeedbackLoop(),
 									pipe.IsTestingAndSamplingDepth(), VK_ATTACHMENT_LOAD_OP_LOAD,
 									pipe.ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE),
 					draw_rt->GetRect());
@@ -10548,7 +10974,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 
 			const GSVector4 drawareaf = GSVector4(config.colclip_update_area);
 			const GSVector4 sRect(drawareaf / GSVector4(rtsize).xyxy());
-			SetPipeline(m_colclip_finish_pipelines[pipe.ds][pipe.IsRTFeedbackLoop()]);
+			SetPipeline(m_colclip_finish_pipelines[DepthSlot(pipe)][pipe.IsRTFeedbackLoop()]);
 			SetUtilityTexture(colclip_rt, m_point_sampler);
 			DrawStretchRect(sRect, drawareaf, rtsize);
 
@@ -10558,6 +10984,610 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	}
 
 	config.colclip_mode = GSHWDrawConfig::ColClipMode::NoModify;
+}
+
+bool GSDeviceVK::RowIsPlain(const GSHWDrawConfig& config, GSTextureVK*& draw_rt, GSTextureVK*& draw_ds, bool& keep_rt,
+	bool& keep_ds)
+{
+	// Nothing deferred or set up around the draw: no coalescing, no depth-as-colour sequence, no colour clip target, no
+	// kept target copy. Whether the in-pass kick is due is asked apart (RowKickDue): it depends on measured times, and
+	// what the row emitter decides from this answer must not.
+	const auto refuse = [](u32 why) {
+		if (GSDrawRows::s_stats) [[unlikely]]
+			GSDrawRows::stats.device_rows_refused[why]++;
+		return false;
+	};
+	if (GSConfig.CoalesceRenderPasses || IsDSInRTActive() || !InRenderPass())
+		return refuse(0);
+	if (m_run_snapshot.tex)
+		return refuse(6);
+	if (GetColorClipTexture())
+		return refuse(7);
+	// A plain draw: one pass of one pipeline, nothing read from the targets.
+	if (config.stencil_counter.enable || config.destination_alpha != GSHWDrawConfig::DestinationAlphaMode::Off ||
+		config.date_copy != GSAlphaBitLogicOp::NoDateCopy || config.require_one_barrier || config.require_full_barrier ||
+		config.blend_multi_pass.enable || config.alpha_second_pass.enable || config.colormask.logic_op != GSAlphaBitLogicOp::Off ||
+		config.ps.HasColorROV() || config.ps.HasDepthROV() || config.ps.colclip_hw || config.colclip_native_scale > 1.0f ||
+		config.tex_hazard != GSHWDrawConfig::TEX_HAZARD_NONE || config.road.clone_rt || config.road.rt_loop ||
+		config.road.depth_loop || config.road.depth_read || config.raster_order || config.IsFeedbackLoopRT(config.ps) ||
+		config.IsFeedbackLoopDepth(config.ps))
+		return refuse(1);
+	// The open pass's own targets, as DoRenderHW keeps them: a draw without one of the two keeps the pass's.
+	draw_rt = static_cast<GSTextureVK*>(config.rt);
+	draw_ds = static_cast<GSTextureVK*>(config.ds);
+	keep_rt = keep_ds = false;
+	if (!((draw_rt && m_current_render_target == draw_rt) || (draw_ds && m_current_depth_target == draw_ds)))
+		return refuse(2);
+	if (!draw_rt && m_current_render_target && config.tex != m_current_render_target && draw_ds &&
+		m_current_render_target->GetSize() == draw_ds->GetSize())
+	{
+		draw_rt = m_current_render_target;
+		keep_rt = true;
+	}
+	else if (!draw_ds && m_current_depth_target && config.tex != m_current_depth_target && draw_rt &&
+			 m_current_depth_target->GetSize() == draw_rt->GetSize())
+	{
+		draw_ds = m_current_depth_target;
+		keep_ds = true;
+	}
+	if (draw_rt != m_current_render_target || draw_ds != m_current_depth_target ||
+		(draw_rt && draw_rt->GetState() != GSTexture::State::Dirty) || (draw_ds && draw_ds->GetState() != GSTexture::State::Dirty))
+		return refuse(3);
+	// A pass opened over its draws holds only the rows inside it, as DoRenderHW keeps only such draws in it: nothing may
+	// render outside a pass's area. The others take the full path, which opens a wider pass.
+	if (m_narrow_render_area &&
+		!m_current_render_pass_area.rcontains(NarrowRenderArea(config.drawarea, (draw_rt ? draw_rt : draw_ds)->GetSize())))
+		return refuse(9);
+	// The open pass's feedback bits, kept on the draw where its road carries them (the draw reads nothing itself).
+	// Anything else would end the pass.
+	u32 loop = FeedbackLoopFlag_None;
+	if (config.road.carry_rt && draw_rt)
+		loop |= m_current_framebuffer_feedback_loop & FeedbackLoopFlag_ReadAndWriteRT;
+	if (config.road.carry_depth && draw_ds)
+		loop |= m_current_framebuffer_feedback_loop & (FeedbackLoopFlag_ReadAndWriteDepth | FeedbackLoopFlag_ReadDepth);
+	if (loop != m_current_framebuffer_feedback_loop)
+		return refuse(5);
+	// Textures ready to sample without a clear or a transition, which would end the pass; none bound for ROV.
+	const auto ready = [](const GSTexture* t) {
+		const GSTextureVK* vt = static_cast<const GSTextureVK*>(t);
+		return vt->GetState() == GSTexture::State::Dirty && vt->GetLayout() == GSTextureVK::Layout::ShaderReadOnly;
+	};
+	const auto bound = [this](const GSTextureVK* t) { return t && t != m_null_texture.get(); };
+	if ((config.tex && (config.tex == config.rt || config.tex == config.ds || !ready(config.tex))) || (config.pal && !ready(config.pal)) ||
+		bound(m_tfx_textures[TFX_TEXTURE_RT_ROV]) || bound(m_tfx_textures[TFX_TEXTURE_DEPTH_ROV]))
+		return refuse(4);
+	return true;
+}
+
+bool GSDeviceVK::RowKickDue()
+{
+	// In a readback-prone frame DoRenderHW may end the pass to submit (its in-pass kick). A draw the open pass keeps
+	// is never at a pass boundary, so only the in-pass offer can fire: the full path takes the draws where it would.
+	constexpr u32 readback_window_frames = 3;
+	if (m_readback_frame == ~0u || (m_frame - m_readback_frame) > readback_window_frames)
+		return false;
+	RollKickBudgetFrame();
+	const bool due = m_draws_since_submit >= READBACK_KICK_DRAWS && m_draws_since_submit >= m_next_in_pass_kick_offer &&
+	                 (m_kick_ns_frame + m_kick_cost_ns) * 4 <= m_readback_block_ns_avg;
+	if (due && GSDrawRows::s_stats) [[unlikely]]
+		GSDrawRows::stats.device_rows_refused[8]++;
+	return due;
+}
+
+bool GSDeviceVK::RowIsPlainOnce(const GSHWDrawConfig& config, GSTextureVK*& draw_rt, GSTextureVK*& draw_ds, bool& keep_rt,
+	bool& keep_ds)
+{
+	// One row asks up to three times (may it go ahead, may it join, draw it now). Nothing between the questions changes
+	// the answer unless the pass ends or the command buffer is submitted.
+	PlainMemo& m = m_plain_memo;
+	const u64 fence = GetCurrentFenceCounter();
+	if (m.row != m_rows_serial || m.config != &config || m.fence != fence || m.pass != m_render_pass_serial || !InRenderPass())
+	{
+		m.plain = RowIsPlain(config, m.rt, m.ds, m.keep_rt, m.keep_ds);
+		m.row = m_rows_serial;
+		m.config = &config;
+		m.fence = fence;
+		m.pass = m_render_pass_serial;
+	}
+	draw_rt = m.rt;
+	draw_ds = m.ds;
+	keep_rt = m.keep_rt;
+	keep_ds = m.keep_ds;
+	return m.plain;
+}
+
+VkPipeline GSDeviceVK::RowPipeline(GSHWDrawConfig& config, GSRowDeviceCache& cache_bytes, PipelineSelector& pipe,
+	bool keep_rt, bool keep_ds)
+{
+	UpdateHWPipelineSelector(config, pipe);
+	if (keep_rt)
+		pipe.rt = true;
+	if (keep_ds)
+	{
+		pipe.ds = true;
+		SetDepthStencilSlot(pipe, IsStencilSlot(m_current_depth_target));
+	}
+	// The pass's carried feedback bits (RowIsPlain checked they are exactly the pass's).
+	pipe.feedback_loop_flags |= m_current_framebuffer_feedback_loop;
+	// The entry's pipeline, remembered with the selector it was looked up for: the selector can still differ between
+	// draws of one entry (the blend carry, the targets kept), and then it is looked up again.
+	RowCache& cache = reinterpret_cast<RowCache&>(cache_bytes);
+	if (cache.gen == s_row_cache_gen && cache.sel == pipe)
+		return cache.pipeline;
+	const VkPipeline pipeline = GetTFXPipeline(pipe);
+	if (pipeline != VK_NULL_HANDLE)
+	{
+		cache.sel = pipe;
+		cache.pipeline = pipeline;
+		cache.gen = s_row_cache_gen;
+	}
+	return pipeline;
+}
+
+void GSDeviceVK::DoDrawRow(GSHWDrawConfig& config, GSRowDeviceCache& cache)
+{
+	GSTextureVK* draw_rt;
+	GSTextureVK* draw_ds;
+	bool keep_rt, keep_ds;
+	const bool plain = RowIsPlainOnce(config, draw_rt, draw_ds, keep_rt, keep_ds);
+	if (GSDrawRows::s_stats) [[unlikely]]
+	{
+		GSDrawRows::stats.device_rows++;
+		GSDrawRows::stats.device_rows_plain += plain;
+	}
+	if (!plain)
+	{
+		RenderHW(config);
+		return;
+	}
+	// The in-pass kick, where it is due and nothing the emitter holds would be split by it: the full path takes the
+	// row to kick there. Its own draw as a row; the streaks are left as they are, since whether a kick is due depends
+	// on measured times and no grouping may (rows deferred by the emitter skip the kick, as the run machine's runs
+	// did, and leave it to a later row).
+	if ((!m_emitter || !m_emitter->AnyPending()) && RowKickDue())
+	{
+		DoRenderHW(config);
+		return;
+	}
+
+	// DoRenderHW's plain path, in its order.
+	RollKickBudgetFrame();
+	m_draws_since_submit++;
+	if (m_date_copy.valid && config.colormask.wa)
+		m_date_copy.valid = false;
+
+	const GSVector2i rtsize(config.rt ? config.rt->GetSize() : config.ds->GetSize());
+	SetVSConstantBuffer(config.cb_vs);
+	SetPSConstantBuffer(config.cb_ps);
+	if (config.tex)
+	{
+		PSSetShaderResource(TFX_TEXTURE_TEXTURE, config.tex, true);
+		PSSetSampler(config.sampler);
+	}
+	if (config.pal)
+		PSSetShaderResource(TFX_TEXTURE_PALETTE, config.pal, true);
+	if (config.blend.constant_enable)
+		SetBlendConstants(config.blend.constant);
+	if (config.topology == GSHWDrawConfig::Topology::Line)
+		SetLineWidth(config.line_expand ? config.cb_ps.ScaleFactor.z : 1.0f);
+
+	if (!config.tex && ((config.rt && static_cast<GSTextureVK*>(config.rt) == m_tfx_textures[0]) ||
+						   (config.ds && static_cast<GSTextureVK*>(config.ds) == m_tfx_textures[0])))
+	{
+		PSSetShaderResource(0, nullptr, false);
+	}
+	PipelineSelector& pipe = m_pipeline_selector;
+	const VkPipeline pipeline = RowPipeline(config, cache, pipe, keep_rt, keep_ds);
+	if (pipe.IsRTFeedbackLoop())
+		PSSetShaderResource(TFX_TEXTURE_RT, draw_rt, false);
+	else
+		PSSetShaderResource(TFX_TEXTURE_RT, nullptr, false);
+	if (pipe.IsDepthFeedbackLoop())
+		PSSetShaderResource(TFX_TEXTURE_DEPTH, draw_ds, false);
+	else
+		PSSetShaderResource(TFX_TEXTURE_DEPTH, nullptr, false);
+	PSSetROVs(nullptr, nullptr, config.ps.HasColorOutput(), config.ps.HasDepthROVWrite());
+	OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
+	pxAssert(InRenderPass());
+
+	UploadHWDrawVerticesAndIndices(config);
+	if (pipeline != VK_NULL_HANDLE)
+	{
+		SetPipeline(pipeline);
+		NoteRunPipeline(pipe);
+		if (ApplyTFXState())
+		{
+			DeclareDrawFeedbackLoop(config, pipe);
+			SendHWDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr, pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr,
+				false, false);
+		}
+	}
+
+	config.colclip_mode = GSHWDrawConfig::ColClipMode::NoModify;
+}
+
+bool GSDeviceVK::RowFitsRunProgram(const GSHWDrawConfig& config, GSRunsPolicy::Draw& d)
+{
+	// The run program draws in the open pass with no feedback loop declared; a row without a depth buffer draws with
+	// the pass's, which its depth state neither tests nor writes.
+	if (m_current_framebuffer_feedback_loop != FeedbackLoopFlag_None || config.ps.colclip_hw ||
+		GSRunsPolicy::OutsidePS(config.ps) || GSRunsPolicy::OutsideVS(config.vs))
+		return false;
+	GSRunsPolicy::TextureFacts tex;
+	if (config.tex)
+	{
+		tex.present = true;
+		tex.is_target = config.tex->IsRenderTargetOrDepthStencil();
+		tex.rgba8 = config.tex->GetFormat() == GSTexture::Format::Color;
+	}
+	d = GSRunsPolicy::Classify(config, tex, GetColorClipTexture() != nullptr);
+	return d.why == GSRunsPolicy::Refusal::None;
+}
+
+VkSampler GSDeviceVK::RowSampler(const GSHWDrawConfig& config)
+{
+	if (config.ps.tfx == 4)
+		return VK_NULL_HANDLE;
+	if (config.sampler.key != m_row_sampler_key)
+	{
+		m_row_sampler_key = config.sampler.key;
+		m_row_sampler = GetSampler(config.sampler);
+	}
+	return m_row_sampler;
+}
+
+void GSDeviceVK::NoteRowDrawn(const GSHWDrawConfig& config)
+{
+	// Still a draw waiting for the next submit, for the in-pass kick. It writes alpha: the shared DATE stencil copy is no
+	// longer true.
+	RollKickBudgetFrame();
+	m_draws_since_submit++;
+	if (m_date_copy.valid && config.colormask.wa)
+		m_date_copy.valid = false;
+}
+
+bool GSDeviceVK::RowsJoin(GSHWDrawConfig& config, GSRowDeviceCache&)
+{
+	if (!m_emitter || !m_emitter->HasRunProgram())
+		return false;
+	GSTextureVK* draw_rt;
+	GSTextureVK* draw_ds;
+	bool keep_rt, keep_ds;
+	if (!RowIsPlainOnce(config, draw_rt, draw_ds, keep_rt, keep_ds))
+	{
+		m_emitter->Break(GSRunEmitterVK::BASES);
+		return false;
+	}
+	if (m_emitter->JoinGroup(GSRunEmitterVK::BASES, config) != GSRunEmitterVK::Join::Joined)
+		return false;
+	NoteRowDrawn(config);
+	return true;
+}
+
+void GSDeviceVK::RowsRecordOpen()
+{
+	if (m_emitter)
+		m_emitter->RecordOpen();
+}
+
+bool GSDeviceVK::RowsHoldTwin(GSHWDrawConfig& config, GSRowDeviceCache& cache)
+{
+	if (!m_emitter)
+		return false;
+	GSTextureVK* draw_rt;
+	GSTextureVK* draw_ds;
+	bool keep_rt, keep_ds;
+	if (!RowIsPlainOnce(config, draw_rt, draw_ds, keep_rt, keep_ds))
+		return false;
+	if (m_emitter->HasRunProgram())
+	{
+		switch (m_emitter->JoinGroup(GSRunEmitterVK::TWINS, config))
+		{
+			case GSRunEmitterVK::Join::Joined:
+				NoteRowDrawn(config);
+				return true;
+			case GSRunEmitterVK::Join::Submitted:
+				return false;
+			case GSRunEmitterVK::Join::Classic:
+				break;
+		}
+	}
+	if (!WriteHeldClassic(config, cache, draw_rt, draw_ds, keep_rt, keep_ds))
+		return false;
+	NoteRowDrawn(config);
+	return true;
+}
+
+bool GSDeviceVK::RowsMayGoAhead(const GSHWDrawConfig& config)
+{
+	GSTextureVK* draw_rt;
+	GSTextureVK* draw_ds;
+	bool keep_rt, keep_ds;
+	return RowIsPlainOnce(config, draw_rt, draw_ds, keep_rt, keep_ds);
+}
+
+void GSDeviceVK::RowsEmit()
+{
+	if (m_emitter)
+		m_emitter->RecordAll();
+}
+
+void GSDeviceVK::RowsDrop()
+{
+	if (m_emitter)
+		m_emitter->Drop();
+}
+
+bool GSDeviceVK::RowsOpen() const
+{
+	return m_emitter && m_emitter->AnyPending();
+}
+
+void GSDeviceVK::RowsOtherDraw()
+{
+	if (m_emitter)
+		m_emitter->BreakAll();
+}
+
+bool GSDeviceVK::WriteHeldClassic(GSHWDrawConfig& config, GSRowDeviceCache& cache, GSTextureVK* draw_rt,
+	GSTextureVK* draw_ds, bool keep_rt, bool keep_ds)
+{
+	// Triangles, or sprites the vertex program expands from the fixed index buffer, in a pass with no feedback loop:
+	// the record then needs no loop declaration, no line width and no storage-buffer indices.
+	const bool fixed_expand = config.vs.expand == GSHWDrawConfig::VSExpand::Sprite;
+	if (config.topology != GSHWDrawConfig::Topology::Triangle ||
+		!(config.vs.expand == GSHWDrawConfig::VSExpand::None || fixed_expand) ||
+		m_current_framebuffer_feedback_loop != FeedbackLoopFlag_None)
+		return false;
+	PipelineSelector pipe;
+	const VkPipeline pipeline = RowPipeline(config, cache, pipe, keep_rt, keep_ds);
+	if (pipeline == VK_NULL_HANDLE || pipe.feedback_loop_flags != FeedbackLoopFlag_None)
+		return false;
+
+	// Everything is reserved before anything is written: a ring that cannot take the draw is a submit, which records
+	// everything pending first, and the twin is then drawn now by the caller.
+	// A twin whose constants or textures equal the last held twin's in this command buffer shares them: its record
+	// names the same offsets and set, so recording it binds nothing new (GSRawBindCache.h).
+	const u32 ubo_align = static_cast<u32>(m_device_properties.limits.minUniformBufferOffsetAlignment);
+	const u32 vsize = config.nverts * sizeof(GSVertex);
+	const u32 isize = fixed_expand ? 0u : config.nindices * sizeof(u16);
+	HeldShare& hs = m_held_share;
+	const u64 fence = GetCurrentFenceCounter();
+	const bool same_cb = hs.fence == fence && std::memcmp(&hs.vs, &config.cb_vs, sizeof(config.cb_vs)) == 0 &&
+	                     std::memcmp(&hs.ps, &config.cb_ps, sizeof(config.cb_ps)) == 0;
+	if (!m_vertex_stream_buffer.ReserveMemory(vsize, sizeof(GSVertex) * GetVertexAlignment(config.vs.expand)) ||
+		(isize && !m_index_stream_buffer.ReserveMemory(isize, sizeof(u16))) ||
+		(!same_cb && (!m_vertex_uniform_stream_buffer.ReserveMemory(sizeof(config.cb_vs), ubo_align) ||
+						 !m_fragment_uniform_stream_buffer.ReserveMemory(sizeof(config.cb_ps), ubo_align))))
+	{
+		ExecuteCommandBufferAndRestartRenderPass(false, "a held twin's rings");
+		return false;
+	}
+	VkDescriptorSet set1 = VK_NULL_HANDLE;
+	VkSampler sampler = config.tex ? RowSampler(config) : VK_NULL_HANDLE;
+	if (!m_use_push_descriptors && hs.fence == fence && hs.set1 != VK_NULL_HANDLE && hs.tex == config.tex &&
+		hs.pal == config.pal && hs.sampler == sampler)
+	{
+		set1 = hs.set1;
+	}
+	else if (!m_use_push_descriptors)
+	{
+		set1 = AllocateDescriptorSetFromFramePool(m_tfx_texture_ds_layout);
+		if (set1 == VK_NULL_HANDLE)
+			return false;
+		std::array<GSTextureVK*, NUM_TFX_TEXTURES> textures;
+		textures.fill(m_null_texture.get());
+		if (config.tex)
+			textures[TFX_TEXTURE_TEXTURE] = static_cast<GSTextureVK*>(config.tex);
+		if (config.pal)
+			textures[TFX_TEXTURE_PALETTE] = static_cast<GSTextureVK*>(config.pal);
+		Vulkan::DescriptorSetUpdateBuilder dsub;
+		AddTFXTextureWrites(dsub, set1, textures, sampler ? sampler : m_point_sampler, DIRTY_FLAG_TFX_TEXTURES);
+		dsub.Update(m_device);
+	}
+
+	GSRunEmitterVK::HeldClassic* h = m_emitter->AddHeldClassic();
+	if (!h)
+		return false;
+	h->pipeline = pipeline;
+	h->ubo_set = m_tfx_ubo_descriptor_set;
+	h->vbuf = m_vertex_stream_buffer.GetBuffer();
+	h->vstart = m_vertex_stream_buffer.GetCurrentOffset() / sizeof(GSVertex);
+	GSVector4i::storent(m_vertex_stream_buffer.GetCurrentHostPointer(), config.verts, vsize);
+	m_vertex_stream_buffer.CommitMemory(vsize);
+	h->fixed_expand = fixed_expand;
+	h->run = !fixed_expand && RunGroupFits(pipe, h->run_mask);
+	h->icount = config.nindices;
+	if (fixed_expand)
+	{
+		h->istart = 0;
+	}
+	else
+	{
+		h->istart = m_index_stream_buffer.GetCurrentOffset() / sizeof(u16);
+		std::memcpy(m_index_stream_buffer.GetCurrentHostPointer(), config.indices, isize);
+		m_index_stream_buffer.CommitMemory(isize);
+	}
+	h->index_range = m_cmd_set_index_range && !fixed_expand && config.nindices > 0;
+	if (h->index_range)
+	{
+		u16 lo = config.indices[0], hi = config.indices[0];
+		for (u32 i = 1; i < config.nindices; i++)
+		{
+			lo = std::min(lo, config.indices[i]);
+			hi = std::max(hi, config.indices[i]);
+		}
+		h->index_min = lo;
+		h->index_max = hi;
+	}
+	if (same_cb)
+	{
+		h->ubo[0] = hs.ubo[0];
+		h->ubo[1] = hs.ubo[1];
+	}
+	else
+	{
+		h->ubo[0] = m_vertex_uniform_stream_buffer.GetCurrentOffset();
+		std::memcpy(m_vertex_uniform_stream_buffer.GetCurrentHostPointer(), &config.cb_vs, sizeof(config.cb_vs));
+		m_vertex_uniform_stream_buffer.CommitMemory(sizeof(config.cb_vs));
+		h->ubo[1] = m_fragment_uniform_stream_buffer.GetCurrentOffset();
+		std::memcpy(m_fragment_uniform_stream_buffer.GetCurrentHostPointer(), &config.cb_ps, sizeof(config.cb_ps));
+		m_fragment_uniform_stream_buffer.CommitMemory(sizeof(config.cb_ps));
+		if (hs.fence != fence)
+			hs.set1 = VK_NULL_HANDLE;
+		hs.fence = fence;
+		hs.vs = config.cb_vs;
+		hs.ps = config.cb_ps;
+		hs.ubo[0] = h->ubo[0];
+		hs.ubo[1] = h->ubo[1];
+	}
+	if (set1 != VK_NULL_HANDLE && set1 != hs.set1 && hs.fence == fence)
+	{
+		hs.set1 = set1;
+		hs.tex = config.tex;
+		hs.pal = config.pal;
+		hs.sampler = sampler;
+	}
+	h->tex = static_cast<GSTextureVK*>(config.tex);
+	h->sampler = sampler ? sampler : m_point_sampler;
+	h->pal = static_cast<GSTextureVK*>(config.pal);
+	h->set1 = set1;
+	h->scissor = config.scissor;
+	const GSVector2i size = draw_rt ? draw_rt->GetSize() : draw_ds->GetSize();
+	h->viewport = {0.0f, 0.0f, static_cast<float>(size.x), static_cast<float>(size.y), 0.0f, 1.0f};
+	h->blend_constant = config.blend.constant_enable;
+	h->blend_constant_color = config.blend.constant;
+	h->pass_rt = m_current_render_target;
+	h->pass_ds = m_current_depth_target;
+	if (h->tex)
+		h->tex->SetUseFenceCounter(fence);
+	if (h->pal)
+		h->pal->SetUseFenceCounter(fence);
+	return true;
+}
+
+void GSDeviceVK::RecordHeldClassic(const GSRunEmitterVK::HeldClassic& h)
+{
+	// The pass the draw was decided in is open: every pass end records what is pending first.
+	pxAssertMsg(InRenderPass() && m_current_render_target == h.pass_rt && m_current_depth_target == h.pass_ds &&
+					m_current_framebuffer_feedback_loop == FeedbackLoopFlag_None,
+		"A held draw is recorded outside the pass it was decided in");
+	const VkCommandBuffer cmd = GetCurrentCommandBuffer();
+	// Held twins are recorded back to back: bind only what differs from the twin before (GSRawBindCache.h).
+	GSRawBindCache::State st;
+	st.pipeline = reinterpret_cast<uptr>(h.pipeline);
+	st.constants_set = reinterpret_cast<uptr>(h.ubo_set);
+	st.constants[0] = h.ubo[0];
+	st.constants[1] = h.ubo[1];
+	st.textures[0] = reinterpret_cast<uptr>(h.tex);
+	st.textures[1] = reinterpret_cast<uptr>(h.sampler);
+	st.textures[2] = reinterpret_cast<uptr>(h.pal);
+	st.textures[3] = reinterpret_cast<uptr>(h.set1);
+	st.viewport[0] = static_cast<s32>(h.viewport.width);
+	st.viewport[1] = static_cast<s32>(h.viewport.height);
+	std::memcpy(st.scissor, &h.scissor, sizeof(st.scissor));
+	st.blend = h.blend_constant ? (0x100u | h.blend_constant_color) : 0u;
+	const VkBuffer ibuf = h.fixed_expand ? m_expand_index_buffer : m_index_stream_buffer.GetBuffer();
+	st.index_buffer = reinterpret_cast<uptr>(ibuf);
+	if (h.run && !h.index_range && h.vbuf == m_vertex_stream_buffer.GetBuffer() && m_current_line_width == 1.0f)
+	{
+		// A group of the driver's run. The viewport and the index buffer are not a group's: their own calls record
+		// the groups before it first.
+		const u32 need = m_raw_binds.Needed(st);
+		if (need & (GSRawBindCache::VIEWPORT | GSRawBindCache::INDEX))
+		{
+			const VkCommandBuffer cmd = GetCurrentCommandBuffer();
+			if (need & GSRawBindCache::VIEWPORT)
+				vkCmdSetViewport(cmd, 0, 1, &h.viewport);
+			if (need & GSRawBindCache::INDEX)
+				vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT16);
+		}
+		if (need & GSRawBindCache::PIPELINE)
+			g_perfmon.Put(GSPerfMon::PipelineSwitches, 1);
+		g_perfmon.Put(GSPerfMon::DrawCalls, 1);
+		std::array<GSTextureVK*, NUM_TFX_TEXTURES> textures;
+		textures.fill(m_null_texture.get());
+		if (h.tex)
+			textures[TFX_TEXTURE_TEXTURE] = h.tex;
+		if (h.pal)
+			textures[TFX_TEXTURE_PALETTE] = h.pal;
+		AppendRunGroup(h.pipeline, h.run_mask, textures.data(), h.sampler, h.ubo_set, h.ubo, h.istart,
+			h.icount, static_cast<s32>(h.vstart), h.blend_constant ? h.blend_constant_color : 0, h.scissor, ~0u);
+		// A group always sets the blend constant: one the draw does not use is not what the record says is bound.
+		if (!h.blend_constant)
+			m_raw_binds.Forget(GSRawBindCache::BLEND);
+		DirtyAfterRawDraws();
+		return;
+	}
+	const u32 need = m_raw_binds.Needed(st);
+	if (need & GSRawBindCache::PIPELINE)
+	{
+		g_perfmon.Put(GSPerfMon::PipelineSwitches, 1);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, h.pipeline);
+	}
+	if (need & GSRawBindCache::CONSTANTS)
+	{
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout, TFX_DESCRIPTOR_SET_UBO, 1,
+			&h.ubo_set, NUM_TFX_DYNAMIC_OFFSETS, h.ubo);
+	}
+	if ((need & GSRawBindCache::TEXTURES) && m_use_push_descriptors)
+	{
+		std::array<GSTextureVK*, NUM_TFX_TEXTURES> textures;
+		textures.fill(m_null_texture.get());
+		if (h.tex)
+			textures[TFX_TEXTURE_TEXTURE] = h.tex;
+		if (h.pal)
+			textures[TFX_TEXTURE_PALETTE] = h.pal;
+		Vulkan::DescriptorSetUpdateBuilder dsub;
+		AddTFXTextureWrites(dsub, VK_NULL_HANDLE, textures, h.sampler, DIRTY_FLAG_TFX_TEXTURES);
+		dsub.PushUpdate(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout, TFX_DESCRIPTOR_SET_TEXTURES);
+	}
+	else if (need & GSRawBindCache::TEXTURES)
+	{
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout, TFX_DESCRIPTOR_SET_TEXTURES,
+			1, &h.set1, 0, nullptr);
+	}
+	if (h.fixed_expand)
+	{
+		GSHWDrawConfig::VSPushConstants pc;
+		pc.base_vertex = h.vstart;
+		pc.base_index = 0;
+		vkCmdPushConstants(cmd, m_tfx_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+	}
+	if (need & GSRawBindCache::VIEWPORT)
+		vkCmdSetViewport(cmd, 0, 1, &h.viewport);
+	if (need & GSRawBindCache::SCISSOR)
+	{
+		const VkRect2D scissor = {{h.scissor.x, h.scissor.y}, {static_cast<u32>(h.scissor.width()), static_cast<u32>(h.scissor.height())}};
+		vkCmdSetScissor(cmd, 0, 1, &scissor);
+	}
+	if (need & GSRawBindCache::BLEND)
+	{
+		const GSVector4 col(static_cast<float>(h.blend_constant_color) / 128.0f);
+		vkCmdSetBlendConstants(cmd, col.v);
+	}
+	if (need & GSRawBindCache::INDEX)
+		vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT16);
+	const bool other_vbuf = h.vbuf != m_vertex_stream_buffer.GetBuffer();
+	if (other_vbuf)
+	{
+		const VkDeviceSize zero = 0;
+		vkCmdBindVertexBuffers(cmd, 0, 1, &h.vbuf, &zero);
+	}
+	g_perfmon.Put(GSPerfMon::DrawCalls, 1);
+	if (h.index_range)
+		m_cmd_set_index_range(cmd, h.istart, h.icount, h.index_min, h.index_max);
+	vkCmdDrawIndexed(cmd, h.icount, 1, h.istart, h.fixed_expand ? 0 : static_cast<s32>(h.vstart), 0);
+	if (other_vbuf)
+		SetInitialState(cmd);
+	DirtyAfterRawDraws();
+}
+
+void GSDeviceVK::DirtyAfterRawDraws()
+{
+	m_current_pipeline_layout = PipelineLayout::Undefined;
+	m_dirty_flags |= DIRTY_FLAG_PIPELINE | DIRTY_FLAG_TFX_UBO | DIRTY_FLAG_TFX_TEXTURES | DIRTY_FLAG_VS_PUSH_CONSTANTS |
+	                 DIRTY_FLAG_VIEWPORT | DIRTY_FLAG_SCISSOR | DIRTY_FLAG_INDEX_BUFFER | DIRTY_FLAG_BLEND_CONSTANTS;
 }
 
 void GSDeviceVK::UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelector& pipe)
@@ -10572,6 +11602,7 @@ void GSDeviceVK::UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelect
 	pipe.topology = static_cast<u32>(config.topology);
 	pipe.rt = config.rt != nullptr && !config.ps.HasColorROV();
 	pipe.ds = config.ds != nullptr && !config.ps.HasDepthROV();
+	SetDepthStencilSlot(pipe, m_features.stencil_on_request && pipe.ds && static_cast<GSTextureVK*>(config.ds)->HasStencilAspect());
 	pipe.line_width = config.line_expand;
 	// Set from the read, not from the barrier request: the ordered roads drop a reader's barriers
 	// and the read is still in the pass.
@@ -10631,7 +11662,9 @@ VkImageMemoryBarrier GSDeviceVK::GetDepthStencilBufferFeedbackBarrier(GSTextureV
 	return {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
 		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, dst_access, layout, layout,
 		VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ds->GetImage(),
-		{VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0u, 1u, 0u, 1u}};
+		{static_cast<VkImageAspectFlags>(ds->HasStencilAspect() ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) :
+		                                                          VK_IMAGE_ASPECT_DEPTH_BIT),
+			0u, 1u, 0u, 1u}};
 }
 
 VkDependencyFlags GSDeviceVK::GetFeedbackBarrierDependencyFlags() const

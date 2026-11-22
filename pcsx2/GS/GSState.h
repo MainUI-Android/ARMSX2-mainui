@@ -474,18 +474,23 @@ protected:
 	//
 	// NOT every pair that could exist. A pair costs its handler, its staged loop,
 	// its per-vertex batch and -- if it takes the kernel -- RunChunk, the driver and
-	// the seam kick, which is about 17 KB of .text each with VertexKick inlined into
-	// three of them. Instantiating all twelve cost 256 KB, and the two titles that
-	// paid for it on the SD865 run none of them.
+	// the seam kick: about 24 KB of .text for a triangle-strip pair in an SD865
+	// build, with VertexKick inlined into three of them. Instantiating all twelve
+	// cost 256 KB, and the two titles that paid for it on the SD865 run none of
+	// them.
 	//
-	// So the set is the one the corpus asks for, counted over all 24 dumps under
-	// both renderers. Four pairs carry 54,716 of the 55,316 fused-layout handler
-	// calls the corpus makes; the two it leaves out are gow2's triangle-strip
-	// {ST, XYZ2} (592 calls) and dirge's triangle-list {RGBAQ, XYZ2} (8), which
-	// together are 1.1% and are not worth 10 KB of footprint on the titles that
-	// never run them. Everything not below keeps a null in the table, and
-	// Transfer replays the tag a qword at a time -- which is exact, and is what
-	// the tag got before SetTag learned to name it.
+	// So the set is the one the corpus asks for, counted as vertices a vsync per
+	// tag layout over its 24 dumps, which also counts the layouts SetTag does not
+	// name. A pair is listed where it lowers the instructions and cycles a vsync
+	// of a title that sends it. Not listed: gow2's triangle-strip {ST, XYZ2}
+	// (about 2,700 vertices a vsync); gow2's strips sent as {XYZ2} alone (3,700),
+	// where a fused handler saved 0.44 M instructions a vsync on the SD865 but no
+	// cycles, because a one-register record already costs one dispatch a vertex;
+	// dirge's {XYZF2} alone (about 14,000, split between triangle lists and
+	// strips); and records that carry several vertices, such as gow2's
+	// {RGBAQ, UV, XYZ2, UV, XYZ2, ...}. Everything not below keeps a null in the
+	// table, and Transfer replays the tag a qword at a time -- which is exact, and
+	// is what the tag got before SetTag learned to name it.
 	template <u32 prim, GSVertexKernels::PackedLayout layout>
 	static constexpr bool LayoutHandlerExists()
 	{
@@ -493,11 +498,16 @@ protected:
 		{
 			// outrun-a/-b and mgs3's NOP-padded triple, 13,900 handler calls
 			// across the corpus; spiderman3's and stuntman's {RGBAQ, XYZ2},
-			// 13,560; and the UV triple, which is the whole triangle stream of
-			// both Baldur's Gate: Dark Alliance titles.
+			// 13,560; the UV triple, which is the whole triangle stream of
+			// both Baldur's Gate: Dark Alliance titles; gow2's NOP-padded
+			// triple with XYZ2, 8,400 vertices a vsync and 14% of its packed
+			// qwords; and sotc's and flatout2's {RGBAQ, XYZF2}, 4,100 and
+			// 1,600 vertices a vsync.
 			return layout == GSVertexKernels::PackedLayout::NopTripleXYZF2 ||
 				   layout == GSVertexKernels::PackedLayout::PairRGBAQXYZ2 ||
-				   layout == GSVertexKernels::PackedLayout::UvTripleXYZF2;
+				   layout == GSVertexKernels::PackedLayout::UvTripleXYZF2 ||
+				   layout == GSVertexKernels::PackedLayout::NopTripleXYZ2 ||
+				   layout == GSVertexKernels::PackedLayout::PairRGBAQXYZF2;
 		}
 		else if constexpr (prim == GS_SPRITE)
 		{
@@ -517,9 +527,8 @@ protected:
 	// And which of those enter the two-pass kernel, which is the expensive half:
 	// RunChunk, its driver and its seam kick are about 9 KB of .text a pair.
 	//
-	// Both triangle-strip pairs enter it -- the NOP-padded triple 12,214 times
-	// and {RGBAQ, XYZ2} 11,600 across the corpus -- and so do the two sprite
-	// pairs. Sprites are auto_flush = true at both GameDB levels and under the
+	// Every triangle-strip pair enters it, and so does every sprite pair.
+	// Sprites are auto_flush = true at both GameDB levels and under the
 	// software renderer, so their chunks are routed: the chunk routing asks the
 	// autoflush predicate without its shuffle test, which is exact, because the
 	// shuffle test can only turn a true answer false, so a chunk for which the
@@ -549,8 +558,12 @@ protected:
 	// following functions need m_vt to be initialized
 
 	GSVertexTrace m_vt;
+	/// Set by every GetAlphaMinMax(). The hardware renderer clears it before a derivation it records, so that a read of
+	/// the draw's alpha range not made through its typed accessor makes the recorded state key the range's values.
+	bool m_alpha_read_raw = false;
 	GSVertexTrace::VertexAlpha& GetAlphaMinMax()
 	{
+		m_alpha_read_raw = true;
 		if (!m_vt.m_alpha.valid)
 			CalcAlphaMinMax(0, INVALID_ALPHA_MINMAX);
 		return m_vt.m_alpha;
@@ -661,6 +674,9 @@ public:
 	// code reads this, never m_regs, because under the split the draw runs after MTGS may have
 	// written the next frame's registers.
 	GSBackQueue::DrawPrivRegs m_draw_priv = {};
+	/// Set by a renderer between a copy that arms a run and the first draw that does not continue it, so that the
+	/// draw executor asks ContinueCopyRun() only then.
+	bool m_copy_run_armed = false;
 	GSLocalMemory m_mem;
 	GSDrawingEnvironment m_env = {};
 	GSDrawingEnvironment m_prev_env = {};
@@ -880,6 +896,10 @@ public:
 	/// GSRendererHWBurstMemo.cpp) does so and returns true; the executor then skips the vertex trace, the
 	/// texel rounding and Draw(), and keeps its own bookkeeping.
 	virtual bool SkipMemoizedDraw() { return false; }
+	/// Called by the draw executor in place of its tail while m_copy_run_armed is set: a renderer that
+	/// executes the draw as the next copy of a run of copies (the hardware renderer's copy runs,
+	/// GSRendererHWCopyRuns.cpp) does all the tail would have done and returns true.
+	virtual bool ContinueCopyRun() { return false; }
 	virtual void PurgeTextureCache(bool sources, bool targets, bool hash_cache);
 	virtual void ReadbackTextureCache();
 	/// Writes into local memory what the hardware renderer holds for it apart from its targets (moved depth
@@ -910,6 +930,7 @@ public:
 	void ExecDrawRecord(const GSBackQueue::DrawRecord& rec);
 	GSBackQueue::DrawPrivRegs CaptureDrawPrivRegs();
 	void DrawRecordTail(u64 draw_serial);
+	void NoteDisplaySpriteBlit();
 	void SubmitPcrtcSync();
 	void ExecPcrtcSyncRecord(const GSBackQueue::PcrtcSyncRecord& rec);
 

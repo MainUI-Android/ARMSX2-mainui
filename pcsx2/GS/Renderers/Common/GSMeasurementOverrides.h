@@ -72,9 +72,14 @@ struct GSMeasurementOverrides
 	/// does not on a single binary.
 	bool no_dual_source = false;
 
-	/// -runs off: the Vulkan run machine (GSRunsVK.h) is not created, so every draw takes the classic path. The
+	/// -runs off: the Vulkan run program (GSRunEmitterVK.h) is not brought up, so every row is drawn classically. The
 	/// baseline of the machine's A/Bs and of its picture checks.
 	bool runs_off = false;
+
+	/// -panvk-bifrost: take what the Vulkan device does on Mesa's PanVK with a Bifrost Mali (narrow render passes,
+	/// depth without stencil until a draw needs it, DATE without depth reading the target) on any driver, to check
+	/// its pictures on a device that is not one.
+	bool panvk_bifrost = false;
 
 	GSLoopDeclarationSpelling LoopSpelling() const
 	{
@@ -85,7 +90,7 @@ struct GSMeasurementOverrides
 	{
 		return self_read_arm != GSSelfReadArm::Off || declare_depth_loop || loop_create_flag || disable_stencil_buffer ||
 		       alpha_bit_logic_op || date_copy_with_dst_alpha_blend || no_provoking_vertex || no_dual_source ||
-		       stream_rings_cached || runs_off;
+		       stream_rings_cached || runs_off || panvk_bifrost;
 	}
 };
 

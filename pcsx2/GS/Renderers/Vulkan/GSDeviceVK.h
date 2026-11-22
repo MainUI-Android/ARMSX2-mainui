@@ -7,8 +7,11 @@
 #include "GS/GSCacheFile.h"
 #include "GS/GSCompileQueue.h"
 #include "GS/Renderers/Common/GSDevice.h"
+#include "GS/Renderers/Common/GSRawBindCache.h"
+#include "GS/Renderers/Common/GSShortRunTextures.h"
 #include "GS/Renderers/Common/GSStreamRingMemoryPolicy.h"
 #include "GS/GSVector.h"
+#include "GS/Renderers/Vulkan/GSRunEmitterVK.h"
 #include "GS/Renderers/Vulkan/GSTextureVK.h"
 #include "GS/Renderers/Vulkan/VKLoader.h"
 #include "GS/Renderers/Vulkan/VKStreamBuffer.h"
@@ -35,17 +38,17 @@
 #include <vector>
 
 class VKSwapChain;
-class GSRunsVK;
 struct GSSelfReadRoadDecision;
 namespace Vulkan
 {
 	class GraphicsPipelineBuilder;
+	class DescriptorSetUpdateBuilder;
 }
 
 class GSDeviceVK final : public GSDevice
 {
-	// The run machine records into this device's command buffers and keeps its state (GSRunsVK.h).
-	friend class GSRunsVK;
+	// The row emitter records into this device's command buffers and marks its cached state dirty (GSRunEmitterVK.h).
+	friend class GSRunEmitterVK;
 
 public:
 	enum : u32
@@ -93,7 +96,7 @@ public:
 		/// remote play's frames go to the video encoder as shared buffers (GSRemotePlay.h).
 		bool vk_android_external_memory_ahb : 1;
 		/// VK_EXT_descriptor_indexing with non-uniform sampled-image indexing, runtime arrays and partially bound
-		/// bindings: the run machine (GSRunsVK) samples each merged draw's own texture from one array. Requested
+		/// bindings: the run program (GSRunEmitterVK) samples each merged row's own texture from one array. Requested
 		/// wherever the driver has all three features.
 		bool vk_ext_descriptor_indexing : 1;
 	};
@@ -244,7 +247,14 @@ public:
 
 	// These command buffers are allocated per-frame. They are valid until the command buffer
 	// is submitted, after that you should call these functions again.
-	__fi VkCommandBuffer GetCurrentCommandBuffer() const { return m_current_command_buffer; }
+	// Records the draws waiting for the driver's run entry first, so that whatever the caller records next lands
+	// after them.
+	__fi VkCommandBuffer GetCurrentCommandBuffer()
+	{
+		if (!m_run_groups.empty() || m_run_group_open)
+			FlushRun();
+		return m_current_command_buffer;
+	}
 	__fi VKStreamBuffer& GetTextureUploadBuffer() { return m_texture_stream_buffer; }
 	VkCommandBuffer GetCurrentInitCommandBuffer();
 
@@ -612,6 +622,17 @@ public:
 	/// or names an enum, and every bit a real key leaves zero.
 	static bool IsLoadableTFXKey(const PipelineSelector& p);
 
+	/// Depth with stencil where stencil_on_request keeps depth and stencil apart: a render pass of its own, so a
+	/// pipeline of its own. The key's bit above stencil_counter, which no other device sets; it is named here rather
+	/// than in the key layout above so that their recorded key lists keep their names.
+	static constexpr u32 TFX_KEY_DS_STENCIL = 1u << 11;
+	/// The depth slot of GetTFXRenderPass: 0 none, 1 depth, 2 depth with stencil.
+	static __fi u32 DepthSlot(const PipelineSelector& p) { return p.ds ? (1u + ((p.key & TFX_KEY_DS_STENCIL) ? 1u : 0u)) : 0u; }
+	static __fi void SetDepthStencilSlot(PipelineSelector& p, bool stencil)
+	{
+		p.key = (p.key & ~TFX_KEY_DS_STENCIL) | (stencil ? TFX_KEY_DS_STENCIL : 0u);
+	}
+
 	struct PipelineSelectorHash
 	{
 		std::size_t operator()(const PipelineSelector& e) const noexcept
@@ -682,11 +703,12 @@ private:
 	std::unordered_map<u32, VkSampler> m_samplers;
 
 	std::vector<VkPipeline> m_convert;
+	std::vector<VkPipeline> m_convert_s8; // depth-output converts into depth with stencil, under stencil_on_request
 	std::array<VkPipeline, static_cast<int>(PresentShader::Count)> m_present{};
 	std::array<VkPipeline, 2> m_merge{};
 	std::array<VkPipeline, NUM_INTERLACE_SHADERS> m_interlace{};
-	VkPipeline m_colclip_setup_pipelines[2][2] = {}; // [depth][feedback_loop]
-	VkPipeline m_colclip_finish_pipelines[2][2] = {}; // [depth][feedback_loop]
+	VkPipeline m_colclip_setup_pipelines[3][2] = {}; // [depth slot][feedback_loop]
+	VkPipeline m_colclip_finish_pipelines[3][2] = {}; // [depth slot][feedback_loop]
 
 	// The stencil counter's resolve (DrawStencilCounter): reads a copy of the target and the stencil
 	// aspect, so it has its own two-texture layout. One pipeline per RGB write mask, made on first use.
@@ -706,6 +728,14 @@ private:
 	VkPipeline GetConvertPipeline(ShaderConvert shader) const
 	{
 		return m_convert[ShaderConvertSelector(shader).Index()];
+	}
+
+	/// The convert pipeline for drawing into dTex: depth with stencil takes its own render pass.
+	VkPipeline GetConvertPipelineFor(ShaderConvertSelector shader, const GSTextureVK* dTex) const
+	{
+		if (shader.DepthOutput() && !shader.DATMConvertShader() && DepthSlot(dTex) == 2)
+			return m_convert_s8[shader.Index()];
+		return m_convert[shader.Index()];
 	}
 
 	/// Guards m_tfx_vertex_shaders and m_tfx_fragment_shaders, which precompile workers fill too.
@@ -762,10 +792,15 @@ private:
 	VkRenderPass m_utility_depth_render_pass_load = VK_NULL_HANDLE;
 	VkRenderPass m_utility_depth_render_pass_clear = VK_NULL_HANDLE;
 	VkRenderPass m_utility_depth_render_pass_discard = VK_NULL_HANDLE;
+	VkRenderPass m_utility_depth_s8_render_pass_load = VK_NULL_HANDLE; // depth with stencil, under stencil_on_request
+	VkRenderPass m_utility_depth_s8_render_pass_clear = VK_NULL_HANDLE;
+	VkRenderPass m_utility_depth_s8_render_pass_discard = VK_NULL_HANDLE;
+	u32 m_depth_stencil_gifts = 0; // GiveDepthStencil calls since m_depth_stencil_gift_frame
+	u32 m_depth_stencil_gift_frame = 0;
 	VkRenderPass m_date_setup_render_pass = VK_NULL_HANDLE;
 	VkRenderPass m_swap_chain_render_pass = VK_NULL_HANDLE;
 
-	VkRenderPass m_tfx_render_pass[2][2][2][3][2][2][3][3] = {}; // [rt][ds][colclip][date][fbl][dsp][rt_op][ds_op]
+	VkRenderPass m_tfx_render_pass[2][3][2][3][2][2][3][3] = {}; // [rt][depth slot][colclip][date][fbl][dsp][rt_op][ds_op]
 
 	VkDescriptorSetLayout m_cas_ds_layout = VK_NULL_HANDLE;
 	VkPipelineLayout m_cas_pipeline_layout = VK_NULL_HANDLE;
@@ -910,11 +945,20 @@ public:
 	/// The window support a window needs. See WindowSystemExtensions.
 	static WindowSystemExtensions GetWindowSystemExtensions(const WindowInfo& wi);
 
-	__fi VkRenderPass GetTFXRenderPass(bool rt, bool ds, bool colclip, bool stencil, bool fbl, bool dsp,
+	/// ds is a depth slot (DepthSlot): 0 none, 1 depth, 2 depth with stencil where stencil_on_request splits them.
+	__fi VkRenderPass GetTFXRenderPass(bool rt, u32 ds, bool colclip, bool stencil, bool fbl, bool dsp,
 		VkAttachmentLoadOp rt_op, VkAttachmentLoadOp ds_op) const
 	{
 		return m_tfx_render_pass[rt][ds][colclip][stencil][fbl][dsp][rt_op][ds_op];
 	}
+
+	/// Whether a depth buffer takes depth slot 2 (TFX_KEY_DS_STENCIL). Only stencil_on_request makes one, so
+	/// everywhere else pipelines and passes are keyed as before.
+	__fi bool IsStencilSlot(const GSTexture* ds) const
+	{
+		return m_features.stencil_on_request && static_cast<const GSTextureVK*>(ds)->HasStencilAspect();
+	}
+	__fi u32 DepthSlot(const GSTexture* ds) const { return ds ? (IsStencilSlot(ds) ? 2 : 1) : 0; }
 	__fi VkSampler GetPointSampler() const { return m_point_sampler; }
 	__fi VkSampler GetLinearSampler() const { return m_linear_sampler; }
 
@@ -927,6 +971,7 @@ public:
 
 	RenderAPI GetRenderAPI() const override;
 	bool HasSurface() const override;
+	void GiveDepthStencil(GSTexture* ds) override;
 
 	bool Create(GSVSyncMode vsync_mode, bool allow_present_throttle) override;
 	void Destroy() override;
@@ -1029,6 +1074,79 @@ public:
 	bool BindDrawPipeline(const PipelineSelector& p);
 
 	void DoRenderHW(GSHWDrawConfig& config) override;
+	/// A draw of a known state (GSDrawRow.h), drawn now. A plain draw into the open pass's own targets, with nothing
+	/// pending on them or on its textures, takes DoRenderHW's plain path with the entry's pipeline remembered; any other
+	/// draw goes through RenderHW.
+	void DoDrawRow(GSHWDrawConfig& config, GSRowDeviceCache& cache) override;
+	// The row emitter's backend (GSRunEmitterVK.h).
+	bool RowsJoin(GSHWDrawConfig& config, GSRowDeviceCache& cache) override;
+	void RowsRecordOpen() override;
+	bool RowsHoldTwin(GSHWDrawConfig& config, GSRowDeviceCache& cache) override;
+	bool RowsMayGoAhead(const GSHWDrawConfig& config) override;
+	void RowsEmit() override;
+	void RowsDrop() override;
+	bool RowsOpen() const override;
+	void RowsOtherDraw() override;
+	/// Whether the run program can draw this plain row, and its classification.
+	bool RowFitsRunProgram(const GSHWDrawConfig& config, GSRunsPolicy::Draw& d);
+	/// RowIsPlain, asked once a row while the pass and the command buffer stay the same.
+	bool RowIsPlainOnce(const GSHWDrawConfig& config, GSTextureVK*& draw_rt, GSTextureVK*& draw_ds, bool& keep_rt, bool& keep_ds);
+	struct PlainMemo
+	{
+		u64 row = ~0ull, fence = 0, pass = 0;
+		const GSHWDrawConfig* config = nullptr;
+		GSTextureVK* rt = nullptr;
+		GSTextureVK* ds = nullptr;
+		bool plain = false, keep_rt = false, keep_ds = false;
+	};
+	PlainMemo m_plain_memo;
+	/// What the held twins recorded so far in this batch have bound (GSRunEmitterVK::RecordAll resets it).
+	GSRawBindCache m_raw_binds;
+	/// The last held twin's constants and texture set, which the next one in the same command buffer may share.
+	struct HeldShare
+	{
+		u64 fence = ~0ull;
+		GSHWDrawConfig::VSConstantBuffer vs;
+		GSHWDrawConfig::PSConstantBuffer ps;
+		u32 ubo[2] = {};
+		VkDescriptorSet set1 = VK_NULL_HANDLE;
+		const GSTexture* tex = nullptr;
+		const GSTexture* pal = nullptr;
+		VkSampler sampler = VK_NULL_HANDLE;
+	};
+	HeldShare m_held_share;
+	/// A plain row's pipeline selector and pipeline (from the entry's cache when its selector matches).
+	VkPipeline RowPipeline(GSHWDrawConfig& config, GSRowDeviceCache& cache, PipelineSelector& pipe, bool keep_rt, bool keep_ds);
+	/// The sampler a textured row samples with (the last one looked up is kept).
+	VkSampler RowSampler(const GSHWDrawConfig& config);
+	/// A row taken by the emitter counts as drawn for the in-pass kick and the shared DATE copy.
+	void NoteRowDrawn(const GSHWDrawConfig& config);
+	/// Writes a plain twin as a held classic draw: vertices, indices and constants into the rings now, the pipeline and
+	/// textures into its record. False: not held (and nothing of it is kept).
+	bool WriteHeldClassic(GSHWDrawConfig& config, GSRowDeviceCache& cache, GSTextureVK* draw_rt, GSTextureVK* draw_ds,
+		bool keep_rt, bool keep_ds);
+	/// Records a held classic draw with raw calls.
+	void RecordHeldClassic(const GSRunEmitterVK::HeldClassic& h);
+	/// After draws recorded with raw calls: the classic path binds all of its state again for its next draw. The
+	/// pipeline it chose (m_current_pipeline) is left alone: a recording from inside ApplyTFXState comes after
+	/// SetPipeline chose it, and the dirty flag makes the apply bind it again.
+	void DirtyAfterRawDraws();
+	/// Adds the writes of every TFX texture slot named in `flags` to `dsub`, for set `ds` (VK_NULL_HANDLE when pushed).
+	void AddTFXTextureWrites(Vulkan::DescriptorSetUpdateBuilder& dsub, VkDescriptorSet ds,
+		const std::array<GSTextureVK*, NUM_TFX_TEXTURES>& textures, VkSampler sampler, u32 flags) const;
+	/// What DrawRow keeps in an entry's GSRowDeviceCache: the selector its pipeline was looked up for.
+	struct RowCache
+	{
+		PipelineSelector sel;
+		VkPipeline pipeline;
+		u32 gen; ///< s_row_cache_gen when filled; pipelines of an older generation were destroyed
+		u32 pad;
+	};
+	static_assert(sizeof(RowCache) <= sizeof(GSRowDeviceCache));
+	/// Whether DrawRow's plain path holds for this draw, and the targets it then draws into.
+	bool RowIsPlain(const GSHWDrawConfig& config, GSTextureVK*& draw_rt, GSTextureVK*& draw_ds, bool& keep_rt, bool& keep_ds);
+	/// Whether DoRenderHW's in-pass kick is due for a draw now (it depends on measured times).
+	bool RowKickDue();
 	void UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelector& pipe);
 	void UploadHWDrawVerticesAndIndices(GSHWDrawConfig& config);
 	VkImageMemoryBarrier GetColorBufferFeedbackBarrier(GSTextureVK* rt) const;
@@ -1056,6 +1174,8 @@ public:
 	/// Ends any render pass, executes the command buffer, and invalidates cached state.
 	void ExecuteCommandBuffer(bool wait_for_completion);
 	void ExecuteCommandBuffer(bool wait_for_completion, const char* reason, ...);
+	/// Executes the command buffer and begins the open render pass again on the same targets. reason: logged, unless
+	/// nullptr.
 	void ExecuteCommandBufferAndRestartRenderPass(bool wait_for_completion, const char* reason);
 	void ExecuteCommandBufferAndRestartPresent(bool wait_for_completion, const char* reason, ...);
 	void ExecuteCommandBufferForReadback();
@@ -1156,6 +1276,81 @@ private:
 		VkCommandBuffer commandBuffer, uint32_t firstIndex, uint32_t indexCount, uint32_t minIndex, uint32_t maxIndex);
 	PFN_vkCmdSetIndexRangeMALISX2 m_cmd_set_index_range = nullptr;
 
+	// armsx2-turnip's run entry: a run of TFX draws recorded in one call, defined as the ordinary binds and the
+	// indexed draw for each group in order. The layouts must match the driver's tu_run, tu_run_group,
+	// tu_run_state and tu_run_texture. Null on every other driver. Draws wait in m_run_groups from ApplyTFXState
+	// to the next use of the command buffer (GetCurrentCommandBuffer), and go to the driver in one call there.
+	struct DrawRunState
+	{
+		VkPipeline pipeline;
+		u32 tex_mask;
+		u32 reserved;
+	};
+	struct DrawRunTexture
+	{
+		VkImageView view;
+		VkSampler sampler;
+	};
+	struct DrawRunGroup
+	{
+		u32 state;
+		u32 tex_first;
+		u32 first_index;
+		u32 index_count;
+		s32 vertex_offset;
+		u32 dyn_offset[2];
+		float blend_constant;
+		VkRect2D scissor;
+	};
+	struct DrawRun
+	{
+		u32 size;
+		u32 abi;
+		u32 group_count;
+		u32 reserved;
+		VkPipelineLayout layout;
+		VkDescriptorSet set0;
+		const DrawRunState* states;
+		const DrawRunGroup* groups;
+		const DrawRunTexture* textures;
+	};
+	static constexpr u32 DRAW_RUN_ABI = 1;
+	static constexpr u32 DRAW_RUN_MAX_GROUPS = 1024;
+	// A run of fewer groups takes the ordinary calls: the entry's call, its catch-up of the state set since the last
+	// draw and the state it marks for sending again when it returns cost more than one or two groups save (measured
+	// on the Adreno 613).
+	static constexpr u32 DRAW_RUN_MIN_GROUPS = 3;
+	using PFN_vkCmdDrawRunARMSX2 = void(VKAPI_PTR*)(VkCommandBuffer commandBuffer, const DrawRun* run);
+	PFN_vkCmdDrawRunARMSX2 m_cmd_draw_run = nullptr;
+
+	VkDescriptorSet m_run_set0 = VK_NULL_HANDLE; ///< the constants set of the waiting groups
+	std::vector<DrawRunState> m_run_states;
+	std::vector<DrawRunGroup> m_run_groups;
+	std::vector<DrawRunTexture> m_run_textures;
+	std::vector<GSTextureVK*> m_run_texture_objs; ///< parallel to m_run_textures
+	std::vector<u32> m_run_group_flags; ///< per group, the ordinary state it owes; ~0u for one the ordinary calls cannot take
+	// The next ApplyTFXState's draw may join the run, and the set-1 bindings its pipeline's shaders read. Both
+	// follow from the pipeline selector; set by NoteRunPipeline, consumed by ApplyTFXState.
+	bool m_run_want = false;
+	u32 m_run_want_mask = 0;
+	// ApplyTFXState took the state of a draw for the run; DrawIndexedPrimitive completes the group. The flags
+	// are what that state owes the ordinary calls if the group is given up before its draw.
+	bool m_run_group_open = false;
+	u32 m_run_open_mask = 0;
+	u32 m_run_open_flags = 0;
+
+	/// Whether a draw of this pipeline can be a group of the driver's run, and the set-1 bindings its shaders read.
+	bool RunGroupFits(const PipelineSelector& p, u32& mask) const;
+	void NoteRunPipeline(const PipelineSelector& p);
+	/// Appends one group to the waiting run, drawn from the bound index and vertex buffers. `textures` is indexed by
+	/// binding; only the bindings in `mask` are read. A group with another constants set starts a run of its own.
+	void AppendRunGroup(VkPipeline pipeline, u32 mask, GSTextureVK* const* textures, VkSampler sampler,
+		VkDescriptorSet set0, const u32* dyn_offsets, u32 first_index, u32 index_count, s32 vertex_offset,
+		u8 blend_constant, const GSVector4i& scissor, u32 ordinary_flags);
+	void EmitRunGroupOrdinary(u32 i, VkCommandBuffer cmdbuf, GSShortRunTextures& textures_owed);
+	void FlushRun();
+	void EmitTFXState(u32 flags, VkCommandBuffer cmdbuf);
+
 	// The smallest and largest index in m_index, when m_index_range_valid: the same range malisx2's
 	// read-back finds, taken from the indices while they are still in cached memory.
 	u16 m_index_min = 0;
@@ -1167,6 +1362,17 @@ private:
 	VkFramebuffer m_current_framebuffer = VK_NULL_HANDLE;
 	VkRenderPass m_current_render_pass = VK_NULL_HANDLE;
 	GSVector4i m_current_render_pass_area = GSVector4i::zero();
+
+	// TFX passes are opened over their draws instead of the whole target where the driver pays for render-pass area.
+	bool m_narrow_render_area = false;
+	u32 m_render_area_growths = 0;
+	VkExtent2D m_render_area_granularity = {};
+	/// The area a pass opened over a draw takes: drawarea with a margin, inside the target.
+	static GSVector4i NarrowRenderArea(const GSVector4i& drawarea, const GSVector2i& size);
+	GSVector4i AlignRenderArea(VkRenderPass rp, const GSVector4i& area, const GSVector2i& size);
+	bool IsDevicePanVKBifrost() const;
+	/// Whether the device's name is name, alone or followed by a space.
+	bool IsDeviceNamed(const char* name) const;
 
 	// Mid-frame submission for readback-prone frames: when a game synchronously reads
 	// GS memory back (local->host TRXDIR), the readback fence-waits on everything
@@ -1190,8 +1396,10 @@ private:
 	/// Render passes ended so far; a stencil copy belongs to the pass it was built in.
 	u64 m_render_pass_serial = 0;
 
-	/// The run machine, where the device has its features (GSRunsVK.h); null elsewhere.
-	std::unique_ptr<GSRunsVK> m_runs;
+	/// The row emitter's Vulkan backend (GSRunEmitterVK.h), with the run program where the device has its features.
+	std::unique_ptr<GSRunEmitterVK> m_emitter;
+	u64 m_row_sampler_key = ~0ull;
+	VkSampler m_row_sampler = VK_NULL_HANDLE;
 	/// A run program's source: the shared header with the non-uniform indexing extension, the stage, then defines.
 	std::string RunsShaderSource(bool vertex, const std::string& defines, const std::string& source) const;
 

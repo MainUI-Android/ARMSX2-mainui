@@ -1,8 +1,7 @@
 # Oracle suite for the GS vertex front-end kernels (GS/GSVertexKick.h): the
 # legacy parse and accept/cull kernels are pinned against independent scalar
-# models over directed edges + randomized sweeps. GV-campaign optimized kernels
-# must pass the same suite bit-for-bit. See
-# scratchpad/mq65-gs-2026-07-18/GIFPACKED-VERTEX-DESIGN.md for the campaign.
+# models over directed edges + randomized sweeps. Optimized kernels must pass
+# the same suite bit-for-bit.
 #
 # The *_policy_tests.cpp, road and profile test files ride this target rather
 # than adding one: what they test is header-only, so they need no extra linkage.
@@ -28,6 +27,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_dynamic_feedback_loop_tests.cpp
 	gs_stream_ring_memory_tests.cpp
 	gs_stream_ring_flush_tests.cpp
+	gs_stream_ring_registry_tests.cpp
 	gs_stream_ring_growth_tests.cpp
 	gs_gpu_driver_profile_tests.cpp
 	gs_driver_report_tests.cpp
@@ -79,6 +79,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_clut_tests.cpp
 	gs_burst_memo_tests.cpp
 	gs_burst_memo_draw_tests.cpp
+	gs_copy_run_tests.cpp
 	gs_alpha_known_bits_tests.cpp
 	gs_alpha_known_rects_tests.cpp
 	gs_alpha_known_rects_draw_tests.cpp
@@ -91,12 +92,17 @@ add_pcsx2_test(gs_vertex_tests
 	gs_sprite_edge_snap_tests.cpp
 	gs_sprite_pass_order_tests.cpp
 	gs_pass_scheduler_tests.cpp
+	gs_row_emitter_tests.cpp
+	gs_raw_bind_cache_tests.cpp
+	gs_short_run_textures_tests.cpp
 	gs_null_device_profile_tests.cpp
 	gs_sw_target_alias_tests.cpp
 	gs_sw_texture_dirty_tests.cpp
 	gs_sw_texture_readers_tests.cpp
 	gs_blend_constant_policy_tests.cpp
 	gs_runs_policy_tests.cpp
+	gs_draw_row_tests.cpp
+	gs_draw_state_table_draw_tests.cpp
 	gs_run_snapshot_tests.cpp
 	gs_blend_carry_tests.cpp
 	gs_over_one_two_pass_tests.cpp
@@ -117,6 +123,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_cull_grid_native_target_tests.cpp
 	gs_point_safe_features_tests.cpp
 	gs_field_shift_detector_tests.cpp
+	gs_device_loss_tests.cpp
 	gs_channel_shuffle_cover_tests.cpp
 	gs_sw_palette_block_copy_tests.cpp
 	gs_target_dirty_tests.cpp
