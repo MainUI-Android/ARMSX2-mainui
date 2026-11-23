@@ -3161,9 +3161,12 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 	}
 
 	// Every instruction is charged its table entry, NOP (SLL $0, $0, 0)
-	// included, as the interpreter charges it. NOP emits no code.
+	// included, as the interpreter charges it. NOP emits no code. A register
+	// jump right after the load of its register pays the stall the interpreter
+	// charges in JR and JALR.
 	const R5900::OPCODE& opcode = R5900::GetCurrentInstruction();
 	s_nBlockCycles += opcode.cycles * (2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1));
+	s_nBlockCycles += R5900::JumpAfterLoadCharge(delayslot ? pc : pc - 4, cpuRegs.code);
 	if (cpuRegs.code != 0)
 	{
 		// Guard: branch/jump in a delay slot would cause infinite
@@ -5419,11 +5422,19 @@ StartRecomp:
 	{
 		// Branch taken — flush and dispatch. recBranchCall already accumulated
 		// any pre-call cycles into RECCYCLE and re-derived it after the C
-		// call, so any further scaleblockcycles_clear() result is the
-		// post-call remainder.
+		// call, so what is left is the sub-cycle remainder. The scaler floors
+		// a charge at 1, which here would charge the block a cycle the
+		// interpreter does not, so a remainder under a cycle is not charged.
 		iFlushCall(FLUSH_EVERYTHING);
 
-		emitCycleUpdateAndEventCheck();
+		if (s_nBlockCycles < 8)
+		{
+			s_nBlockCycles = 0;
+			armAsm->Cmp(RECCYCLE, 0);
+			emitDispatcherCondBranch(a64::ge, DispatcherEvent, s_condVeneerEvent);
+		}
+		else
+			emitCycleUpdateAndEventCheck();
 
 		armEmitJmp(DispatcherReg);
 	}
