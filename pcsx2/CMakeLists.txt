@@ -130,6 +130,7 @@ set(pcsx2Sources
 	R3000AInterpreter.cpp
 	R3000AOpcodeTables.cpp
 	R5900.cpp
+	R5900IssueModel.cpp
 	R5900OpcodeImpl.cpp
 	R5900OpcodeTables.cpp
 	SaveState.cpp
@@ -239,6 +240,7 @@ set(pcsx2Headers
 	PrecompiledHeader.h
 	R3000A.h
 	R5900.h
+	R5900IssueModel.h
 	R5900OpcodeTables.h
 	SaveState.h
 	SaveStateLegacy.h
@@ -1489,7 +1491,6 @@ set(pcsx2arm64Sources
 	arm64/vuaot/VuAotIR.cpp
 	arm64/vuaot/VuAotLower.cpp
 	arm64/vuaot/VuAotMvuTrace.cpp
-	arm64/vuaot/VuAotPersist.cpp
 	arm64/vuaot/VuAotPipe.cpp
 	arm64/vuaot/VuAotTier.cpp
 	arm64/vuaot/VuAotRegion.cpp
@@ -1507,6 +1508,9 @@ set(pcsx2arm64Headers
 	arm64/iR5900-arm64.h
 	arm64/iR5900Analysis.h
 	arm64/microVU-arm64.h
+	arm64/microVU_ChunkPack-arm64.inl
+	arm64/microVU_ChunkStore-arm64.h
+	arm64/microVU_ChunkStore-arm64.inl
 	arm64/microVU_Persist-arm64.h
 	arm64/microVU_Persist-arm64.inl
 	arm64/microVU_ProgCache-arm64.h
@@ -1517,7 +1521,6 @@ set(pcsx2arm64Headers
 	arm64/microVU_JumpTable-arm64.h
 	arm64/vuaot/VuAotBackground.h
 	arm64/vuaot/VuAotDecode.h
-	arm64/vuaot/VuAotPersist.h
 	arm64/vuaot/VuAotGraph.h
 	arm64/vuaot/VuAotIR.h
 	arm64/vuaot/VuAotLive.h
@@ -1611,12 +1614,13 @@ if(ARMSX2_IOS)
 		# iOS has no libpcap, so pcap_io.cpp is excluded above; reuse the (platform-
 		# agnostic) Android stub to supply the PCAPAdapter definitions DEV9 references.
 		Android/AndroidPcapStubs.cpp)
-	# MacOSStubs.cpp excludes itself on the embedded platforms (it is
-	# !TARGET_OS_IPHONE throughout), so what those need instead is here: the
+	# MacOSStubs.cpp holds the CocoaTools stubs every iOS and tvOS build
+	# compiles. A core also needs what AppleEmbeddedStubs.cpp adds: the
 	# optical drive CDVDdiscReader names, the sound CocoaTools would have
-	# played, and the downloader there is no libcurl for. Only for a core: the
-	# iOS app answers for all of it in its own IOS/HostImpls.mm, and two
-	# definitions of each is a duplicate symbol at link.
+	# played, and the downloader there is no libcurl for. The iOS app answers
+	# for all of it in platforms/ios/Runtime (HostImpls.mm and
+	# PlaySoundAsync.mm), and two definitions of each is a duplicate
+	# symbol at link.
 	if(ENABLE_LIBRETRO)
 		list(APPEND pcsx2Sources
 			Apple/AppleEmbeddedStubs.cpp)
